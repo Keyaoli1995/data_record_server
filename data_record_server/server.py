@@ -12,6 +12,7 @@ from .storage import Storage
 
 
 LOGGER = logging.getLogger(__name__)
+_SHUTDOWN_SIGNALS = frozenset((signal.SIGINT, signal.SIGTERM))
 
 
 class CollectorRequestHandler(socketserver.BaseRequestHandler):
@@ -138,17 +139,23 @@ def create_shutdown_handler(server: CollectorServer) -> Callable[[int, object], 
     """Create a signal handler that requests a server shutdown safely."""
 
     def shutdown_handler(signum: int, _frame: object) -> None:
-        LOGGER.info("Received signal %s; shutting down", signum)
-        worker = threading.Thread(target=server.shutdown, daemon=True)
-        register_shutdown_worker = getattr(server, "register_shutdown_worker", None)
-        if register_shutdown_worker is None or register_shutdown_worker(worker):
-            try:
-                worker.start()
-            except BaseException:
-                clear_shutdown_worker = getattr(server, "clear_shutdown_worker", None)
-                if clear_shutdown_worker is not None:
-                    clear_shutdown_worker(worker)
-                raise
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
+        try:
+            LOGGER.info("Received signal %s; shutting down", signum)
+            worker = threading.Thread(target=server.shutdown, daemon=True)
+            register_shutdown_worker = getattr(server, "register_shutdown_worker", None)
+            if register_shutdown_worker is None or register_shutdown_worker(worker):
+                try:
+                    worker.start()
+                except BaseException:
+                    clear_shutdown_worker = getattr(
+                        server, "clear_shutdown_worker", None
+                    )
+                    if clear_shutdown_worker is not None:
+                        clear_shutdown_worker(worker)
+                    raise
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
     return shutdown_handler
 
