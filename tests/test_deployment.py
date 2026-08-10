@@ -119,10 +119,34 @@ class DeploymentFilesTest(unittest.TestCase):
         }
 
         self.assertTrue(
-            {".git", "__pycache__", "*.py[cod]", "data", "docs", "tests"}.issubset(
+            {
+                ".git",
+                ".env",
+                "__pycache__",
+                "*.py[cod]",
+                "data",
+                "docs",
+                "tests",
+            }.issubset(
                 ignored_paths
             )
         )
+
+    def test_local_docker_environment_file_is_ignored(self):
+        git_ignored_paths = {
+            line.strip()
+            for line in (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+
+        self.assertIn(".env", git_ignored_paths)
+        result = subprocess.run(
+            ["git", "check-ignore", "-q", ".env"],
+            cwd=PROJECT_ROOT,
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(0, result.returncode)
 
     def _copy_preparation_script(self, temporary_directory):
         repository = Path(temporary_directory) / "repo"
