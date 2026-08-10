@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -123,32 +124,117 @@ class DeploymentFilesTest(unittest.TestCase):
             )
         )
 
-    def test_prepare_data_dir_script_creates_a_writable_bind_mount_directory(self):
+    def _copy_preparation_script(self, temporary_directory):
+        repository = Path(temporary_directory) / "repo"
+        scripts_directory = repository / "scripts"
+        scripts_directory.mkdir(parents=True)
         script = PROJECT_ROOT / "scripts" / "prepare-data-dir.sh"
         self.assertTrue(script.is_file(), "bind-mount preparation script must exist")
         self.assertTrue(
             script.stat().st_mode & stat.S_IXUSR,
             "bind-mount preparation script must be executable",
         )
+        copied_script = scripts_directory / script.name
+        shutil.copy2(script, copied_script)
+        return repository, copied_script
 
+    def test_prepare_data_dir_script_is_anchored_and_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            data_dir = Path(temporary_directory) / "data"
+            repository, script = self._copy_preparation_script(temporary_directory)
+            data_dir = repository / "data"
+            sample_file = data_dir / "connections" / "sample.bin"
+            sample_file.parent.mkdir(parents=True)
+            sample_file.write_bytes(b"captured bytes")
+            external_data_dir = Path(temporary_directory) / "external-data"
             environment = os.environ | {
-                "DATA_DIR": str(data_dir),
+                "DATA_DIR": str(external_data_dir),
                 "COLLECTOR_UID": str(os.getuid()),
                 "COLLECTOR_GID": str(os.getgid()),
             }
-            result = subprocess.run(
+            first_result = subprocess.run(
                 [str(script)],
-                cwd=PROJECT_ROOT,
+                cwd=repository,
                 env=environment,
                 capture_output=True,
                 text=True,
                 check=False,
             )
-            self.assertEqual(0, result.returncode, result.stderr)
+            second_result = subprocess.run(
+                [str(script)],
+                cwd=repository,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(0, first_result.returncode, first_result.stderr)
+            self.assertEqual(0, second_result.returncode, second_result.stderr)
+            self.assertFalse(external_data_dir.exists())
             data_stat = data_dir.stat()
             self.assertTrue(data_dir.is_dir())
             self.assertEqual(os.getuid(), data_stat.st_uid)
             self.assertEqual(os.getgid(), data_stat.st_gid)
             self.assertEqual(0o750, stat.S_IMODE(data_stat.st_mode))
+            self.assertEqual(b"captured bytes", sample_file.read_bytes())
+            self.assertTrue(os.access(sample_file, os.R_OK | os.W_OK))
+
+    def test_prepare_data_dir_script_refuses_a_data_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository, script = self._copy_preparation_script(temporary_directory)
+            sentinel_directory = Path(temporary_directory) / "sentinel"
+            sentinel_directory.mkdir()
+            sentinel_file = sentinel_directory / "do-not-touch.bin"
+            sentinel_file.write_bytes(b"sentinel")
+            sentinel_stat = sentinel_directory.stat()
+            (repository / "data").symlink_to(sentinel_directory, target_is_directory=True)
+
+            result = subprocess.run(
+                [str(script)],
+                cwd=repository,
+                env=os.environ
+                | {
+                    "COLLECTOR_UID": str(os.getuid()),
+                    "COLLECTOR_GID": str(os.getgid()),
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertEqual(b"sentinel", sentinel_file.read_bytes())
+            updated_sentinel_stat = sentinel_directory.stat()
+            self.assertEqual(sentinel_stat.st_uid, updated_sentinel_stat.st_uid)
+            self.assertEqual(sentinel_stat.st_gid, updated_sentinel_stat.st_gid)
+            self.assertEqual(
+                stat.S_IMODE(sentinel_stat.st_mode),
+                stat.S_IMODE(updated_sentinel_stat.st_mode),
+            )
+
+    def test_prepare_data_dir_script_handles_mismatched_ownership_safely(self):
+        script_source = (PROJECT_ROOT / "scripts" / "prepare-data-dir.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'chown -R -h -- "$COLLECTOR_UID:$COLLECTOR_GID" "$DATA_DIR"',
+            script_source,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository, script = self._copy_preparation_script(temporary_directory)
+            data_dir = repository / "data"
+            data_dir.mkdir()
+            sample_file = data_dir / "sample.bin"
+            sample_file.write_bytes(b"captured bytes")
+            result = subprocess.run(
+                [str(script)],
+                cwd=repository,
+                env=os.environ | {"COLLECTOR_UID": "10001", "COLLECTOR_GID": "10001"},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("sudo", result.stderr)
+            self.assertEqual(b"captured bytes", sample_file.read_bytes())
