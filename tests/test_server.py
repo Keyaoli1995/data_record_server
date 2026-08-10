@@ -274,6 +274,65 @@ class CollectorServerTest(unittest.TestCase):
         first_worker.start.assert_called_once_with()
         second_worker.start.assert_not_called()
 
+    def test_sigterm_reenters_shutdown_handler_while_worker_lock_is_held(self):
+        child_code = """
+import os
+import signal
+import tempfile
+
+from data_record_server.server import CollectorServer, create_shutdown_handler
+from data_record_server.storage import Storage
+
+with tempfile.TemporaryDirectory() as directory:
+    server = CollectorServer(("127.0.0.1", 0), Storage(directory), 4)
+    try:
+        server.shutdown = lambda: None
+        signal.signal(signal.SIGTERM, create_shutdown_handler(server))
+        with server._shutdown_worker_lock:
+            os.kill(os.getpid(), signal.SIGTERM)
+        server.wait_for_shutdown_worker()
+    finally:
+        server.server_close()
+"""
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+        process = subprocess.Popen(
+            [sys.executable, "-c", child_code],
+            cwd=Path(__file__).resolve().parents[1],
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+                self.fail("SIGTERM handler deadlocked while the worker lock was held")
+            self.assertEqual(0, process.returncode, process.stderr.read())
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+            process.stderr.close()
+
+    @mock.patch("data_record_server.server.threading.Thread")
+    def test_shutdown_handler_clears_a_worker_when_start_fails(self, thread_class):
+        first_worker = mock.Mock()
+        first_worker.start.side_effect = RuntimeError("thread start failed")
+        second_worker = mock.Mock()
+        thread_class.side_effect = [first_worker, second_worker]
+        shutdown_handler = create_shutdown_handler(self._server)
+
+        with self.assertRaisesRegex(RuntimeError, "thread start failed"):
+            shutdown_handler(15, None)
+        shutdown_handler(15, None)
+
+        self.assertIs(self._server._shutdown_worker, second_worker)
+        second_worker.start.assert_called_once_with()
+
     @mock.patch("data_record_server.server.threading.Thread")
     def test_shutdown_handler_requests_shutdown_from_another_thread(
         self, thread_class
