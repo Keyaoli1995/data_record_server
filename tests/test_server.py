@@ -5,6 +5,7 @@ import json
 import os
 import signal
 import socket
+import socketserver
 import subprocess
 import sys
 import tempfile
@@ -117,6 +118,52 @@ class CollectorServerTest(unittest.TestCase):
 
             self.assertEqual(1, len(captured_bind_errors))
             self.assertIs(captured_bind_errors[0], caught.exception)
+            self.assertEqual(2, len(captured_file_descriptors))
+            self._assert_file_descriptors_closed(captured_file_descriptors)
+        finally:
+            self._close_file_descriptors(captured_file_descriptors)
+
+    def test_constructor_preserves_bind_error_when_tcp_close_fails(self):
+        bind_error = OSError("bind failed")
+        close_error = OSError("TCP socket close failed")
+        captured_file_descriptors = []
+        close_attempts = []
+        real_pipe = os.pipe
+        real_tcp_server_close = socketserver.TCPServer.server_close
+
+        def capture_pipe():
+            file_descriptors = real_pipe()
+            captured_file_descriptors.extend(file_descriptors)
+            return file_descriptors
+
+        def fail_bind(_server):
+            raise bind_error
+
+        def fail_after_tcp_close(server):
+            close_attempts.append(1)
+            real_tcp_server_close(server)
+            raise close_error
+
+        try:
+            with mock.patch(
+                "data_record_server.server.os.pipe", side_effect=capture_pipe
+            ), mock.patch.object(
+                CollectorServer, "server_bind", fail_bind
+            ), mock.patch.object(
+                socketserver.TCPServer, "server_close", fail_after_tcp_close
+            ), mock.patch(
+                "data_record_server.server.LOGGER.exception"
+            ) as log_exception:
+                with self.assertRaises(OSError) as caught:
+                    CollectorServer(
+                        ("127.0.0.1", 0), Storage(self._data_dir), 4
+                    )
+
+            self.assertIs(bind_error, caught.exception)
+            self.assertEqual([1], close_attempts)
+            log_exception.assert_called_once_with(
+                "Failed to close TCP socket during construction"
+            )
             self.assertEqual(2, len(captured_file_descriptors))
             self._assert_file_descriptors_closed(captured_file_descriptors)
         finally:
