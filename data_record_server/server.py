@@ -66,7 +66,7 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self._active_requests = set()
         self._active_requests_condition = threading.Condition()
         self._shutdown_worker = None
-        self._shutdown_worker_lock = threading.Lock()
+        self._shutdown_worker_lock = threading.RLock()
         super().__init__(server_address, CollectorRequestHandler)
 
     def process_request(self, request, client_address) -> None:
@@ -120,6 +120,12 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         if worker is not None and worker is not threading.current_thread():
             worker.join()
 
+    def clear_shutdown_worker(self, worker) -> None:
+        """Release ownership when a registered worker cannot be started."""
+        with self._shutdown_worker_lock:
+            if self._shutdown_worker is worker:
+                self._shutdown_worker = None
+
 
 def create_server(config: Config) -> CollectorServer:
     """Create a collector bound to the configured address."""
@@ -136,7 +142,13 @@ def create_shutdown_handler(server: CollectorServer) -> Callable[[int, object], 
         worker = threading.Thread(target=server.shutdown, daemon=True)
         register_shutdown_worker = getattr(server, "register_shutdown_worker", None)
         if register_shutdown_worker is None or register_shutdown_worker(worker):
-            worker.start()
+            try:
+                worker.start()
+            except BaseException:
+                clear_shutdown_worker = getattr(server, "clear_shutdown_worker", None)
+                if clear_shutdown_worker is not None:
+                    clear_shutdown_worker(worker)
+                raise
 
     return shutdown_handler
 
