@@ -65,6 +65,8 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.read_buffer_bytes = read_buffer_bytes
         self._active_requests = set()
         self._active_requests_condition = threading.Condition()
+        self._shutdown_worker = None
+        self._shutdown_worker_lock = threading.Lock()
         super().__init__(server_address, CollectorRequestHandler)
 
     def process_request(self, request, client_address) -> None:
@@ -103,6 +105,21 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             while self._active_requests:
                 self._active_requests_condition.wait()
 
+    def register_shutdown_worker(self, worker) -> bool:
+        """Keep ownership of the first signal-triggered shutdown worker."""
+        with self._shutdown_worker_lock:
+            if self._shutdown_worker is not None:
+                return False
+            self._shutdown_worker = worker
+            return True
+
+    def wait_for_shutdown_worker(self) -> None:
+        """Wait for the signal-triggered shutdown worker when called externally."""
+        with self._shutdown_worker_lock:
+            worker = self._shutdown_worker
+        if worker is not None and worker is not threading.current_thread():
+            worker.join()
+
 
 def create_server(config: Config) -> CollectorServer:
     """Create a collector bound to the configured address."""
@@ -116,7 +133,10 @@ def create_shutdown_handler(server: CollectorServer) -> Callable[[int, object], 
 
     def shutdown_handler(signum: int, _frame: object) -> None:
         LOGGER.info("Received signal %s; shutting down", signum)
-        threading.Thread(target=server.shutdown, daemon=True).start()
+        worker = threading.Thread(target=server.shutdown, daemon=True)
+        register_shutdown_worker = getattr(server, "register_shutdown_worker", None)
+        if register_shutdown_worker is None or register_shutdown_worker(worker):
+            worker.start()
 
     return shutdown_handler
 
@@ -142,6 +162,7 @@ def run_server(config: Config) -> None:
             try:
                 if serve_forever_started:
                     server.shutdown()
+                    server.wait_for_shutdown_worker()
             finally:
                 for received_signal, previous_handler in previous_handlers.items():
                     signal.signal(received_signal, previous_handler)
