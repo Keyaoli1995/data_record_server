@@ -253,6 +253,111 @@ class CollectorServerTest(unittest.TestCase):
             self.assertTrue(run_server_returned.is_set())
             self.assertFalse(run_server_thread.is_alive())
 
+    def test_run_server_preserves_the_first_signal_install_exception(self):
+        install_error = ValueError("SIGINT install failed")
+        cleanup_error = RuntimeError("unexpected restore")
+        signal_calls = []
+
+        class ControlledServer:
+            server_address = ("127.0.0.1", 40123)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_arguments):
+                return False
+
+            def start_shutdown_coordinator(self):
+                return True
+
+            def cancel_shutdown_coordinator(self):
+                return None
+
+            def wait_for_shutdown_coordinator(self):
+                return None
+
+        def install_signal(received_signal, handler):
+            signal_calls.append((received_signal, handler))
+            if len(signal_calls) == 1:
+                raise install_error
+            raise cleanup_error
+
+        with mock.patch(
+            "data_record_server.server.create_server", return_value=ControlledServer()
+        ), mock.patch(
+            "data_record_server.server.signal.getsignal", return_value=object()
+        ), mock.patch(
+            "data_record_server.server.signal.signal", side_effect=install_signal
+        ):
+            with self.assertRaises(ValueError) as caught:
+                from data_record_server.server import run_server
+
+                run_server(
+                    Config("127.0.0.1", 0, self._data_dir, 4)
+                )
+
+        self.assertIs(install_error, caught.exception)
+        self.assertEqual(1, len(signal_calls))
+        self.assertEqual(signal.SIGINT, signal_calls[0][0])
+
+    def test_run_server_restores_only_installed_handlers_after_setup_failure(self):
+        install_error = ValueError("SIGTERM install failed")
+        cleanup_error = RuntimeError("SIGINT restore failed")
+        previous_sigint_handler = object()
+        signal_calls = []
+
+        class ControlledServer:
+            server_address = ("127.0.0.1", 40123)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_arguments):
+                return False
+
+            def start_shutdown_coordinator(self):
+                return True
+
+            def cancel_shutdown_coordinator(self):
+                return None
+
+            def wait_for_shutdown_coordinator(self):
+                return None
+
+        def install_signal(received_signal, handler):
+            signal_calls.append((received_signal, handler))
+            if len(signal_calls) == 1:
+                return None
+            if len(signal_calls) == 2:
+                raise install_error
+            raise cleanup_error
+
+        with mock.patch(
+            "data_record_server.server.create_server", return_value=ControlledServer()
+        ), mock.patch(
+            "data_record_server.server.signal.getsignal", side_effect=[
+                previous_sigint_handler,
+                object(),
+            ]
+        ), mock.patch(
+            "data_record_server.server.signal.signal", side_effect=install_signal
+        ), mock.patch("data_record_server.server.LOGGER.exception") as log_exception:
+            with self.assertRaises(ValueError) as caught:
+                from data_record_server.server import run_server
+
+                run_server(
+                    Config("127.0.0.1", 0, self._data_dir, 4)
+                )
+
+        self.assertIs(install_error, caught.exception)
+        self.assertEqual(3, len(signal_calls))
+        self.assertEqual(signal.SIGINT, signal_calls[0][0])
+        self.assertEqual(signal.SIGTERM, signal_calls[1][0])
+        self.assertEqual(
+            (signal.SIGINT, previous_sigint_handler), signal_calls[2]
+        )
+        log_exception.assert_called_once()
+
     def test_shutdown_handler_only_notifies_the_server(self):
         with mock.patch.object(self._server, "notify_shutdown") as notify_shutdown, mock.patch(
             "data_record_server.server.threading.Thread"
