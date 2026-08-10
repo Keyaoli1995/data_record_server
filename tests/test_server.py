@@ -187,6 +187,80 @@ class CollectorServerTest(unittest.TestCase):
                     process.wait(timeout=2)
                 process.stderr.close()
 
+    def test_serve_loop_failure_closes_active_connections_before_propagating(self):
+        serve_error = RuntimeError("serve loop failed")
+        failure_requested = threading.Event()
+        client_recorded = threading.Event()
+        allow_client_receive = threading.Event()
+        client_result = []
+        server = create_server(
+            Config("127.0.0.1", 0, self._data_dir, 4)
+        )
+
+        def service_actions():
+            if failure_requested.is_set():
+                raise serve_error
+
+        def run_client():
+            try:
+                with socket.create_connection(server.server_address, timeout=2) as client:
+                    client.sendall(b"abc")
+                    deadline = time.monotonic() + 2
+                    while time.monotonic() < deadline:
+                        if any(
+                            event["event"] == "received"
+                            and event["hex"] == b"abc".hex()
+                            for event in self._read_events()
+                        ):
+                            failure_requested.set()
+                            client_recorded.set()
+                            break
+                        time.sleep(0.01)
+                    else:
+                        client_result.append(AssertionError("client bytes were not recorded"))
+                        return
+                    self.assertTrue(allow_client_receive.wait(timeout=5))
+                    client.settimeout(1)
+                    client_result.append(client.recv(1))
+            except BaseException as error:
+                client_result.append(error)
+
+        server.service_actions = service_actions
+        client_thread = threading.Thread(target=run_client)
+        client_thread.start()
+        try:
+            with mock.patch(
+                "data_record_server.server.create_server", return_value=server
+            ), mock.patch(
+                "data_record_server.server.signal.getsignal", return_value=object()
+            ), mock.patch("data_record_server.server.signal.signal"):
+                with self.assertRaises(RuntimeError) as caught:
+                    from data_record_server.server import run_server
+
+                    run_server(Config("127.0.0.1", 0, self._data_dir, 4))
+
+            self.assertIs(serve_error, caught.exception)
+            self.assertTrue(client_recorded.is_set())
+            self._wait_for(
+                lambda: any(
+                    event["event"] == "disconnected"
+                    and event["total_bytes"] == 3
+                    for event in self._read_events()
+                )
+            )
+            with server._active_requests_condition:
+                self.assertFalse(server._active_requests)
+            allow_client_receive.set()
+            client_thread.join(timeout=2)
+            self.assertFalse(client_thread.is_alive())
+            self.assertEqual([b""], client_result)
+            server.wait_for_shutdown_coordinator()
+        finally:
+            allow_client_receive.set()
+            client_thread.join(timeout=2)
+            server.shutdown()
+            server.server_close()
+
     def test_run_server_waits_for_the_signal_shutdown_worker(self):
         allow_shutdown_to_finish = threading.Event()
         shutdown_notification_requested = threading.Event()
