@@ -85,14 +85,11 @@ docker compose logs --tail=100 collector
 docker compose ps
 docker compose logs --tail=100 collector
 
-# Compose 看到的已发布端口；自定义 .env 时请先按上一节在当前终端加载它
-docker compose port collector "${TCP_PORT:-30050}"
+# 默认端口：Compose 看到的已发布端口
+docker compose port collector 30050
 
-# 从另一台可访问公网的客户端实际探测。需要安装 netcat/nc。
-nc -vz 8.134.210.73 "${TCP_PORT:-30050}"
-
-# ss 只作为宿主机的补充观察，不能单独证明 Docker 端口映射正确
-sudo ss -ltnp | grep ":${TCP_PORT:-30050}"
+# 默认端口下，ss 只作为宿主机的补充观察，不能单独证明 Docker 端口映射正确
+sudo ss -ltnp | grep ':30050'
 
 # 末尾事件；尚未有数据时给出提示
 if [ -f data/events.jsonl ]; then
@@ -120,6 +117,29 @@ else
   echo '没有可查看的 .bin 文件'
 fi
 ```
+
+自定义端口命令会使用 shell 展开的 `TCP_PORT`。Compose 会自行读取 `.env`，但 shell 不会；在服务器当前终端、并且**紧接在执行自定义端口命令前**加载和校验：
+
+```bash
+set -a
+. ./.env
+set +a
+case "$TCP_PORT" in '' | *[!0-9]*) echo 'TCP_PORT 必须是十进制整数'; exit 1;; esac
+docker compose port collector "$TCP_PORT"
+sudo ss -ltnp | grep ":$TCP_PORT"
+```
+
+从另一台可访问公网的客户端实际探测时，客户端不能读取服务器的 `.env`，必须填写已经配置的实际端口（需安装 netcat/nc）：
+
+```bash
+# 默认端口
+nc -vz 8.134.210.73 30050
+
+# 自定义示例：服务器 .env 中为 TCP_PORT=30100
+nc -vz 8.134.210.73 30100
+```
+
+请将示例端口替换为服务器当前配置的实际端口。
 
 `events.jsonl` 每行都是一个独立 JSON 对象，常见字段如下：
 
@@ -181,8 +201,21 @@ docker compose up -d --build
 ```bash
 docker compose ps
 docker compose logs --tail=100 collector
-docker compose port collector "${TCP_PORT:-30050}"
-sudo ss -ltnp | grep ":${TCP_PORT:-30050}"
+
+# 默认端口；自定义 .env 时，改用紧随本代码块之后的加载/校验命令。
+docker compose port collector 30050
+sudo ss -ltnp | grep ':30050'
+```
+
+自定义端口时，在服务器当前终端、紧接在端口检查前执行：
+
+```bash
+set -a
+. ./.env
+set +a
+case "$TCP_PORT" in '' | *[!0-9]*) echo 'TCP_PORT 必须是十进制整数'; exit 1;; esac
+docker compose port collector "$TCP_PORT"
+sudo ss -ltnp | grep ":$TCP_PORT"
 ```
 
 ### App 连接超时
@@ -194,11 +227,25 @@ sudo ss -ltnp | grep ":${TCP_PORT:-30050}"
 当前 WSL 环境无法执行 Docker 命令（Docker CLI 不可用），因此没有在此环境进行容器启动、`docker compose config` 或镜像构建验证。请在目标阿里云服务器完成目录准备后执行。若使用自定义设置，请保留上一节的 `.env`，并在同一终端先加载/校验它，再执行以下命令；不要临时省略 UID/GID 或端口：
 
 ```bash
-# 自定义 .env 时，先按“自定义 UID/GID 或端口”章节加载变量。
 docker compose config --quiet
 docker compose up -d --build
 docker compose ps
-docker compose port collector "${TCP_PORT:-30050}"
 ```
 
-再从外部网络执行 `nc -vz 8.134.210.73 "${TCP_PORT:-30050}"`，并从 App 发起真实 TCP 连接。确认 `data/connections/` 出现对应 `.bin` 文件；在 App 关闭该连接后，`data/events.jsonl` 应出现同名文件的 `connected`、`received` 和 `disconnected` 事件。
+默认端口的服务器端发布检查：
+
+```bash
+docker compose port collector 30050
+```
+
+自定义端口的服务器端发布检查，必须先在当前 shell 加载 `.env`，再展开 `$TCP_PORT`：
+
+```bash
+set -a
+. ./.env
+set +a
+case "$TCP_PORT" in '' | *[!0-9]*) echo 'TCP_PORT 必须是十进制整数'; exit 1;; esac
+docker compose port collector "$TCP_PORT"
+```
+
+再从外部网络以实际端口探测并从 App 发起真实 TCP 连接：默认端口使用 `nc -vz 8.134.210.73 30050`；如果 `.env` 中为 `TCP_PORT=30100`，则使用 `nc -vz 8.134.210.73 30100`。外部客户端不能读取服务器 `.env`，请将示例端口替换为当前实际值。确认 `data/connections/` 出现对应 `.bin` 文件；在 App 关闭该连接后，`data/events.jsonl` 应出现同名文件的 `connected`、`received` 和 `disconnected` 事件。
