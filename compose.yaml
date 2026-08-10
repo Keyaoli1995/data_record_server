@@ -2,6 +2,9 @@ services:
   collector:
     build:
       context: .
+      args:
+        COLLECTOR_UID: "${COLLECTOR_UID:-10001}"
+        COLLECTOR_GID: "${COLLECTOR_GID:-10001}"
     environment:
       TCP_HOST: 0.0.0.0
       TCP_PORT: ${TCP_PORT:-30050}
@@ -20,3 +23,4 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    user: "${COLLECTOR_UID:-10001}:${COLLECTOR_GID:-10001}"
