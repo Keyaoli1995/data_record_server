@@ -1,6 +1,10 @@
 """Deployment contract tests for the TCP raw-data collector."""
 
 import json
+import os
+import stat
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -118,3 +122,33 @@ class DeploymentFilesTest(unittest.TestCase):
                 ignored_paths
             )
         )
+
+    def test_prepare_data_dir_script_creates_a_writable_bind_mount_directory(self):
+        script = PROJECT_ROOT / "scripts" / "prepare-data-dir.sh"
+        self.assertTrue(script.is_file(), "bind-mount preparation script must exist")
+        self.assertTrue(
+            script.stat().st_mode & stat.S_IXUSR,
+            "bind-mount preparation script must be executable",
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            data_dir = Path(temporary_directory) / "data"
+            environment = os.environ | {
+                "DATA_DIR": str(data_dir),
+                "COLLECTOR_UID": str(os.getuid()),
+                "COLLECTOR_GID": str(os.getgid()),
+            }
+            result = subprocess.run(
+                [str(script)],
+                cwd=PROJECT_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            data_stat = data_dir.stat()
+            self.assertTrue(data_dir.is_dir())
+            self.assertEqual(os.getuid(), data_stat.st_uid)
+            self.assertEqual(os.getgid(), data_stat.st_gid)
+            self.assertEqual(0o750, stat.S_IMODE(data_stat.st_mode))
