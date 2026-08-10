@@ -246,7 +246,9 @@ def create_shutdown_handler(server: CollectorServer) -> Callable[[int, object], 
 
 def run_server(config: Config) -> None:
     """Run a configured collector until it is stopped by a termination signal."""
-    with create_server(config) as server:
+    server = create_server(config)
+    primary_exception = None
+    try:
         signals = (signal.SIGINT, signal.SIGTERM)
         previous_handlers = {
             received_signal: signal.getsignal(received_signal)
@@ -294,3 +296,13 @@ def run_server(config: Config) -> None:
                     server.wait_for_shutdown_coordinator()
             finally:
                 restore_installed_handlers()
+    except BaseException as error:
+        primary_exception = error
+        raise
+    finally:
+        try:
+            server.server_close()
+        except BaseException:
+            if primary_exception is None:
+                raise
+            LOGGER.exception("Failed to close TCP server while preserving primary error")
