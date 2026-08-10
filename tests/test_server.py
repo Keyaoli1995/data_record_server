@@ -1,7 +1,11 @@
 """Integration tests for the concurrent raw TCP collector server."""
 
 import json
+import os
+import signal
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -67,14 +71,41 @@ class CollectorServerTest(unittest.TestCase):
         self.assertEqual(b"abcdef", bytes.fromhex("".join(event["hex"] for event in received)))
         self.assertEqual(6, sum(event["bytes"] for event in received))
 
-    def test_accepts_a_second_client_after_the_first_disconnects(self):
-        for payload in (b"first", b"second"):
+    def test_accepts_a_second_client_while_the_first_remains_connected(self):
+        with socket.create_connection(
+            self._server.server_address, timeout=2
+        ) as first_client:
+            first_client.sendall(b"first")
+            self._wait_for(
+                lambda: any(
+                    event["event"] == "received" and event["hex"] == b"firs".hex()
+                    for event in self._read_events()
+                )
+            )
+
             with socket.create_connection(
                 self._server.server_address, timeout=2
-            ) as client:
-                client.sendall(payload)
-                client.shutdown(socket.SHUT_WR)
-                self.assertEqual(b"", client.recv(1))
+            ) as second_client:
+                second_client.sendall(b"second")
+                second_client.shutdown(socket.SHUT_WR)
+                self.assertEqual(b"", second_client.recv(1))
+
+            self._wait_for(
+                lambda: len(
+                    [
+                        event
+                        for event in self._read_events()
+                        if event["event"] == "disconnected"
+                    ]
+                )
+                == 1
+            )
+            completed_file = next(
+                event["file"]
+                for event in self._read_events()
+                if event["event"] == "disconnected"
+            )
+            self.assertEqual(b"second", (self._data_dir / completed_file).read_bytes())
 
         self._wait_for(
             lambda: len(
@@ -86,12 +117,75 @@ class CollectorServerTest(unittest.TestCase):
             )
             == 2
         )
-
         connection_files = list((self._data_dir / "connections").glob("*.bin"))
         self.assertEqual(2, len(connection_files))
         self.assertEqual(
             {b"first", b"second"}, {path.read_bytes() for path in connection_files}
         )
+        events_by_file = {}
+        for event in self._read_events():
+            events_by_file.setdefault(event["file"], []).append(event)
+        for relative_path, events in events_by_file.items():
+            payload = (self._data_dir / relative_path).read_bytes()
+            self.assertEqual("connected", events[0]["event"])
+            self.assertEqual("disconnected", events[-1]["event"])
+            self.assertEqual(
+                payload,
+                bytes.fromhex(
+                    "".join(event["hex"] for event in events if event["event"] == "received")
+                ),
+            )
+            self.assertEqual(len(payload), events[-1]["total_bytes"])
+
+    def test_sigterm_closes_an_active_connection_before_process_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            port = self._find_free_tcp_port()
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "TCP_HOST": "127.0.0.1",
+                    "TCP_PORT": str(port),
+                    "DATA_DIR": str(data_dir),
+                    "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+                }
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-m", "data_record_server"],
+                cwd=Path(__file__).resolve().parents[1],
+                env=environment,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            client = None
+            try:
+                client = self._connect_to_process(port, process)
+                client.sendall(b"abc")
+                self._wait_for(
+                    lambda: any(
+                        event["event"] == "received" and event["hex"] == b"abc".hex()
+                        for event in self._read_events_from(data_dir)
+                    )
+                )
+
+                process.send_signal(signal.SIGTERM)
+                process.wait(timeout=2)
+                self.assertEqual(0, process.returncode)
+
+                events = self._read_events_from(data_dir)
+                self.assertEqual(
+                    ["connected", "received", "disconnected"],
+                    [event["event"] for event in events],
+                )
+                self.assertEqual(3, events[-1]["total_bytes"])
+            finally:
+                if client is not None:
+                    client.close()
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=2)
+                process.stderr.close()
 
     @mock.patch("data_record_server.server.threading.Thread")
     def test_shutdown_handler_requests_shutdown_from_another_thread(
@@ -103,7 +197,28 @@ class CollectorServerTest(unittest.TestCase):
         thread_class.return_value.start.assert_called_once_with()
 
     def _read_events(self):
-        events_path = self._data_dir / "events.jsonl"
+        return self._read_events_from(self._data_dir)
+
+    @staticmethod
+    def _find_free_tcp_port():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+
+    def _connect_to_process(self, port, process):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                self.fail(f"collector process exited with {process.returncode}")
+            try:
+                return socket.create_connection(("127.0.0.1", port), timeout=0.2)
+            except OSError:
+                time.sleep(0.01)
+        self.fail("collector process did not accept a connection before the deadline")
+
+    @staticmethod
+    def _read_events_from(data_dir):
+        events_path = data_dir / "events.jsonl"
         if not events_path.exists():
             return []
         return [
