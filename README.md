@@ -44,7 +44,11 @@ COLLECTOR_GID=1000
 TCP_PORT=30100
 ```
 
-Compose 会自动读取项目根目录的 `.env`，让构建参数、容器 `user`、端口映射和容器内 `TCP_PORT` 使用同一组值。但 `sudo` 不会自动读取它。每次进行自定义准备、启动、状态检查或排障时，都在**同一个终端会话**中先运行下面的“安全读取和校验”片段；它不会 `source` 或执行 `.env` 中的内容。
+Compose 会自动读取项目根目录的 `.env`，让构建参数、容器 `user`、端口映射和容器内 `TCP_PORT` 使用同一组值。但 `sudo` 不会自动读取它。
+
+### 仅加载并校验 `.env`（无副作用）
+
+每次进行自定义准备、启动、状态检查或排障时，都在**同一个终端会话**中先运行下面的片段。它只读取、解析和校验变量；不会 `source` 或执行 `.env` 内容，也不会调用 `sudo`、Docker、网络或修改目录。
 
 ```bash
 # 安全读取唯一且非空的 KEY=value；不 source/eval .env 内容。
@@ -71,14 +75,20 @@ if ! [ "$TCP_PORT" -ge 1 ] 2>/dev/null || ! [ "$TCP_PORT" -le 65535 ] 2>/dev/nul
   echo 'TCP_PORT 必须在 1 到 65535 之间'
   exit 1
 fi
+```
 
+### 使用校验值准备并启动
+
+在刚运行完上面的无副作用片段的同一终端中，执行：
+
+```bash
 sudo env COLLECTOR_UID="$COLLECTOR_UID" COLLECTOR_GID="$COLLECTOR_GID" scripts/prepare-data-dir.sh
 docker compose config --quiet
 docker compose up -d --build
 docker compose ps
 ```
 
-在该会话中，准备脚本收到的 UID/GID 与 `.env` 中 Compose 使用的值一致；`$TCP_PORT` 也已通过校验，可安全用于紧随其后的端口检查。即使打开新终端，Compose 也会自动从 `.env` 读取配置；但任何需要 shell 展开 `$TCP_PORT` 的命令仍要先重新运行上述片段。不要跳过目录准备步骤：容器以非 root 身份写入 `/data`，错误的目录所有权会导致无法保存采集结果。
+在该会话中，准备脚本收到的 UID/GID 与 `.env` 中 Compose 使用的值一致；`$TCP_PORT` 也已通过校验，可安全用于紧随其后的端口检查。即使打开新终端，Compose 也会自动从 `.env` 读取配置；但任何需要 shell 展开 `$TCP_PORT` 的命令仍要先重新运行**仅加载并校验 `.env`（无副作用）**片段。不要跳过目录准备步骤：容器以非 root 身份写入 `/data`，错误的目录所有权会导致无法保存采集结果。
 
 ## 启动与连接配置
 
@@ -134,7 +144,7 @@ else
 fi
 ```
 
-自定义端口命令会使用 shell 展开的 `TCP_PORT`。Compose 会自行读取 `.env`，但 shell 不会；在服务器当前终端、并且**紧接在执行自定义端口命令前**完整运行“自定义 UID/GID 或端口”章节的“安全读取和校验”片段，然后执行：
+自定义端口命令会使用 shell 展开的 `TCP_PORT`。Compose 会自行读取 `.env`，但 shell 不会；在服务器当前终端、并且**紧接在执行自定义端口命令前**只运行“仅加载并校验 `.env`（无副作用）”片段，然后执行：
 
 ```bash
 docker compose port collector "$TCP_PORT"
@@ -193,10 +203,15 @@ sudo scripts/prepare-data-dir.sh
 docker compose up -d --build
 ```
 
-自定义 UID/GID 时，保留现有 `.env`，并在同一终端先完整运行“自定义 UID/GID 或端口”章节的“安全读取和校验”片段，再恢复目录权限和启动：
+自定义 UID/GID 时，先停止服务。`docker compose down` 可自行读取 `.env`，因此无需先加载变量：
 
 ```bash
 docker compose down
+```
+
+然后在**同一终端**只运行“仅加载并校验 `.env`（无副作用）”片段；它完成后，再执行目录修复与启动：
+
+```bash
 sudo env COLLECTOR_UID="$COLLECTOR_UID" COLLECTOR_GID="$COLLECTOR_GID" scripts/prepare-data-dir.sh
 docker compose up -d --build
 ```
@@ -214,7 +229,7 @@ docker compose port collector 30050
 sudo ss -ltnp | grep ':30050'
 ```
 
-自定义端口时，在服务器当前终端、紧接在端口检查前完整运行“自定义 UID/GID 或端口”章节的“安全读取和校验”片段，然后执行：
+自定义端口时，在服务器当前终端、紧接在端口检查前只运行“仅加载并校验 `.env`（无副作用）”片段，然后执行：
 
 ```bash
 docker compose port collector "$TCP_PORT"
@@ -227,7 +242,7 @@ sudo ss -ltnp | grep ":$TCP_PORT"
 
 ## 部署验证说明
 
-当前 WSL 环境无法执行 Docker 命令（Docker CLI 不可用），因此没有在此环境进行容器启动、`docker compose config` 或镜像构建验证。请在目标阿里云服务器完成目录准备后执行。若使用自定义设置，请保留上一节的 `.env`，并在同一终端先完整运行“自定义 UID/GID 或端口”章节的“安全读取和校验”片段，再执行以下命令；不要临时省略 UID/GID 或端口：
+当前 WSL 环境无法执行 Docker 命令（Docker CLI 不可用），因此没有在此环境进行容器启动、`docker compose config` 或镜像构建验证。请在目标阿里云服务器完成目录准备后执行。若使用自定义设置，请保留上一节的 `.env`，并在同一终端先只运行“仅加载并校验 `.env`（无副作用）”片段，再执行以下命令；不要临时省略 UID/GID 或端口：
 
 ```bash
 docker compose config --quiet
@@ -241,7 +256,7 @@ docker compose ps
 docker compose port collector 30050
 ```
 
-自定义端口的服务器端发布检查，必须先在当前 shell 完整运行“自定义 UID/GID 或端口”章节的“安全读取和校验”片段，再展开 `$TCP_PORT`：
+自定义端口的服务器端发布检查，必须先在当前 shell 只运行“仅加载并校验 `.env`（无副作用）”片段，再展开 `$TCP_PORT`：
 
 ```bash
 docker compose port collector "$TCP_PORT"
