@@ -188,18 +188,13 @@ class CollectorServerTest(unittest.TestCase):
                 process.stderr.close()
 
     def test_run_server_waits_for_the_signal_shutdown_worker(self):
-        shutdown_started = threading.Event()
         allow_shutdown_to_finish = threading.Event()
-        synchronous_shutdown_finished = threading.Event()
+        shutdown_notification_requested = threading.Event()
         run_server_returned = threading.Event()
         previous_handler = object()
-        test_case = self
 
         class ControlledServer:
             server_address = ("127.0.0.1", 40123)
-
-            def __init__(self):
-                self._shutdown_worker = None
 
             def __enter__(self):
                 return self
@@ -207,20 +202,17 @@ class CollectorServerTest(unittest.TestCase):
             def __exit__(self, *_arguments):
                 return False
 
+            def start_shutdown_coordinator(self):
+                return True
+
             def serve_forever(self):
-                signal_handlers[signal.SIGTERM](signal.SIGTERM, None)
-                test_case.assertTrue(shutdown_started.wait(timeout=1))
+                return None
 
-            def shutdown(self):
-                if self._shutdown_worker is None:
-                    self._shutdown_worker = threading.current_thread()
-                    shutdown_started.set()
-                    allow_shutdown_to_finish.wait(timeout=2)
-                    return
-                synchronous_shutdown_finished.set()
+            def notify_shutdown(self):
+                shutdown_notification_requested.set()
 
-            def wait_for_shutdown_worker(self):
-                self._shutdown_worker.join(timeout=2)
+            def wait_for_shutdown_coordinator(self):
+                allow_shutdown_to_finish.wait(timeout=2)
 
         controlled_server = ControlledServer()
         signal_handlers = {}
@@ -253,7 +245,7 @@ class CollectorServerTest(unittest.TestCase):
             run_server_thread = threading.Thread(target=run)
             run_server_thread.start()
             try:
-                self.assertTrue(synchronous_shutdown_finished.wait(timeout=1))
+                self.assertTrue(shutdown_notification_requested.wait(timeout=1))
                 self.assertFalse(run_server_returned.wait(timeout=0.2))
             finally:
                 allow_shutdown_to_finish.set()
@@ -261,20 +253,18 @@ class CollectorServerTest(unittest.TestCase):
             self.assertTrue(run_server_returned.is_set())
             self.assertFalse(run_server_thread.is_alive())
 
-    @mock.patch("data_record_server.server.threading.Thread")
-    def test_shutdown_handler_does_not_replace_a_live_worker(self, thread_class):
-        first_worker = mock.Mock()
-        second_worker = mock.Mock()
-        thread_class.side_effect = [first_worker, second_worker]
+    def test_shutdown_handler_only_notifies_the_server(self):
+        with mock.patch.object(self._server, "notify_shutdown") as notify_shutdown, mock.patch(
+            "data_record_server.server.threading.Thread"
+        ) as thread_class:
+            shutdown_handler = create_shutdown_handler(self._server)
+            shutdown_handler(15, None)
+            shutdown_handler(15, None)
 
-        shutdown_handler = create_shutdown_handler(self._server)
-        shutdown_handler(15, None)
-        shutdown_handler(15, None)
+        self.assertEqual(2, notify_shutdown.call_count)
+        thread_class.assert_not_called()
 
-        first_worker.start.assert_called_once_with()
-        second_worker.start.assert_not_called()
-
-    def test_sigterm_reenters_shutdown_handler_while_worker_lock_is_held(self):
+    def test_sigterm_notifies_shutdown_handler_while_coordinator_lock_is_held(self):
         child_code = """
 import os
 import signal
@@ -288,9 +278,9 @@ with tempfile.TemporaryDirectory() as directory:
     try:
         server.shutdown = lambda: None
         signal.signal(signal.SIGTERM, create_shutdown_handler(server))
-        with server._shutdown_worker_lock:
+        with server._shutdown_coordinator_lock:
             os.kill(os.getpid(), signal.SIGTERM)
-        server.wait_for_shutdown_worker()
+        server.wait_for_shutdown_coordinator()
     finally:
         server.server_close()
 """
@@ -318,65 +308,102 @@ with tempfile.TemporaryDirectory() as directory:
                 process.wait(timeout=2)
             process.stderr.close()
 
-    def test_nested_sigterm_does_not_replace_the_registered_shutdown_worker(self):
+    def test_cross_thread_nested_sigterm_uses_one_shutdown_coordinator(self):
         child_code = """
 import inspect
 import os
 import signal
 import sys
 import tempfile
+import threading
 
 import data_record_server.server as server_module
 from data_record_server.server import CollectorServer, create_shutdown_handler
 from data_record_server.storage import Storage
 
 
-class Worker:
-    def __init__(self, *, target, daemon):
-        self.target = target
-        self.daemon = daemon
-
-    def start(self):
-        started.append(self)
-
-
-started = []
+executions = []
 injected = [False]
-source_lines, source_start_line = inspect.getsourcelines(
-    CollectorServer.register_shutdown_worker
+uses_coordinator = hasattr(CollectorServer, "start_shutdown_coordinator")
+trace_function = (
+    create_shutdown_handler
+    if uses_coordinator
+    else CollectorServer.register_shutdown_worker
 )
-assignment_line = next(
+source_lines, source_start_line = inspect.getsourcelines(trace_function)
+trace_line = next(
     source_start_line + offset
     for offset, line in enumerate(source_lines)
-    if "self._shutdown_worker = worker" in line
+    if (
+        "server.notify_shutdown()" in line
+        if uses_coordinator
+        else "self._shutdown_worker = worker" in line
+    )
 )
+background_ready = threading.Event()
+request_nested_signal = threading.Event()
+sent_nested_signal = threading.Event()
+release_background = threading.Event()
+
+
+def background():
+    background_ready.set()
+    request_nested_signal.wait(timeout=1)
+    os.kill(os.getpid(), signal.SIGTERM)
+    sent_nested_signal.set()
+    release_background.wait(timeout=1)
 
 
 def trace(frame, event, _argument):
     if (
         event == "line"
-        and frame.f_code is CollectorServer.register_shutdown_worker.__code__
-        and frame.f_lineno == assignment_line
+        and (
+            frame.f_code.co_name == "shutdown_handler"
+            if uses_coordinator
+            else frame.f_code is trace_function.__code__
+        )
+        and frame.f_lineno == trace_line
         and not injected[0]
     ):
         injected[0] = True
-        os.kill(os.getpid(), signal.SIGTERM)
+        request_nested_signal.set()
+        assert sent_nested_signal.wait(timeout=1)
     return trace
 
 
 with tempfile.TemporaryDirectory() as directory:
     server = CollectorServer(("127.0.0.1", 0), Storage(directory), 4)
     try:
-        server.shutdown = lambda: None
-        server_module.threading.Thread = Worker
+        server.shutdown = lambda: executions.append(1)
+        if uses_coordinator:
+            server.start_shutdown_coordinator()
+            coordinator = server._shutdown_coordinator
+        background_thread = threading.Thread(target=background)
+        background_thread.start()
+        assert background_ready.wait(timeout=1)
+        if not uses_coordinator:
+            class SynchronousWorker:
+                def __init__(self, *, target, daemon):
+                    self.target = target
+
+                def start(self):
+                    self.target()
+
+            server_module.threading.Thread = SynchronousWorker
+            server_module.signal.pthread_sigmask = lambda _how, _mask: set()
         signal.signal(signal.SIGTERM, create_shutdown_handler(server))
         sys.settrace(trace)
         os.kill(os.getpid(), signal.SIGTERM)
         sys.settrace(None)
         assert injected[0]
-        assert len(started) == 1, len(started)
-        assert server._shutdown_worker is started[0]
+        if uses_coordinator:
+            server.wait_for_shutdown_coordinator()
+            assert server._shutdown_coordinator is coordinator
+        assert len(executions) == 1, len(executions)
     finally:
+        release_background.set()
+        if "background_thread" in locals():
+            background_thread.join(timeout=1)
         server.server_close()
 """
         environment = os.environ.copy()
@@ -404,28 +431,23 @@ with tempfile.TemporaryDirectory() as directory:
             process.stderr.close()
 
     @mock.patch("data_record_server.server.threading.Thread")
-    def test_shutdown_handler_clears_a_worker_when_start_fails(self, thread_class):
+    def test_coordinator_start_failure_allows_a_later_retry(self, thread_class):
         first_worker = mock.Mock()
         first_worker.start.side_effect = RuntimeError("thread start failed")
         second_worker = mock.Mock()
         thread_class.side_effect = [first_worker, second_worker]
-        shutdown_handler = create_shutdown_handler(self._server)
 
         with self.assertRaisesRegex(RuntimeError, "thread start failed"):
-            shutdown_handler(15, None)
-        shutdown_handler(15, None)
+            self._server.start_shutdown_coordinator()
+        self._server.start_shutdown_coordinator()
 
-        self.assertIs(self._server._shutdown_worker, second_worker)
+        self.assertIs(self._server._shutdown_coordinator, second_worker)
         second_worker.start.assert_called_once_with()
 
-    @mock.patch("data_record_server.server.threading.Thread")
-    def test_shutdown_handler_requests_shutdown_from_another_thread(
-        self, thread_class
-    ):
-        create_shutdown_handler(self._server)(15, None)
+    def test_wait_for_shutdown_coordinator_avoids_joining_its_own_thread(self):
+        self._server._shutdown_coordinator = threading.current_thread()
 
-        thread_class.assert_called_once_with(target=self._server.shutdown, daemon=True)
-        thread_class.return_value.start.assert_called_once_with()
+        self._server.wait_for_shutdown_coordinator()
 
     def _read_events(self):
         return self._read_events_from(self._data_dir)
