@@ -255,16 +255,27 @@ def run_server(config: Config) -> None:
         shutdown_handler = create_shutdown_handler(server)
         coordinator_started = False
         serve_forever_started = False
+        installed_signals = []
+
+        def restore_installed_handlers() -> None:
+            for received_signal in reversed(installed_signals):
+                try:
+                    signal.signal(received_signal, previous_handlers[received_signal])
+                except BaseException:
+                    LOGGER.exception(
+                        "Failed to restore signal handler for %s", received_signal
+                    )
 
         try:
             server.start_shutdown_coordinator()
             coordinator_started = True
             for received_signal in signals:
                 signal.signal(received_signal, shutdown_handler)
+                installed_signals.append(received_signal)
             LOGGER.info("Listening on %s:%s", *server.server_address)
             serve_forever_started = True
             server.serve_forever()
-        finally:
+        except BaseException:
             try:
                 if coordinator_started:
                     if serve_forever_started:
@@ -272,6 +283,14 @@ def run_server(config: Config) -> None:
                     else:
                         server.cancel_shutdown_coordinator()
                     server.wait_for_shutdown_coordinator()
+            except BaseException:
+                LOGGER.exception("Failed while cleaning up TCP shutdown coordinator")
+            restore_installed_handlers()
+            raise
+        else:
+            try:
+                if coordinator_started:
+                    server.notify_shutdown()
+                    server.wait_for_shutdown_coordinator()
             finally:
-                for received_signal, previous_handler in previous_handlers.items():
-                    signal.signal(received_signal, previous_handler)
+                restore_installed_handlers()
