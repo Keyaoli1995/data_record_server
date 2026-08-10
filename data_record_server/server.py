@@ -2,6 +2,7 @@
 
 import logging
 import signal
+import socket
 import socketserver
 import threading
 from typing import Callable
@@ -30,14 +31,22 @@ class CollectorRequestHandler(socketserver.BaseRequestHandler):
                 try:
                     recorder.record_error(error)
                 except Exception:
-                    LOGGER.exception("Failed to record client connection error")
-            LOGGER.exception("Failed while recording client connection")
+                    LOGGER.exception(
+                        "Failed to record client connection error from %s",
+                        self.client_address,
+                    )
+            LOGGER.exception(
+                "Failed while recording client connection from %s", self.client_address
+            )
         finally:
             if recorder is not None:
                 try:
                     recorder.close()
                 except Exception:
-                    LOGGER.exception("Failed to close client connection recorder")
+                    LOGGER.exception(
+                        "Failed to close client connection recorder for %s",
+                        self.client_address,
+                    )
 
 
 class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -54,7 +63,45 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     ) -> None:
         self.storage = storage
         self.read_buffer_bytes = read_buffer_bytes
+        self._active_requests = set()
+        self._active_requests_condition = threading.Condition()
         super().__init__(server_address, CollectorRequestHandler)
+
+    def process_request(self, request, client_address) -> None:
+        """Track a request before starting its worker thread."""
+        with self._active_requests_condition:
+            self._active_requests.add(request)
+
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.shutdown_request(request)
+            raise
+
+    def shutdown_request(self, request) -> None:
+        """Close a handled request and mark its worker as finished."""
+        try:
+            super().shutdown_request(request)
+        finally:
+            with self._active_requests_condition:
+                self._active_requests.discard(request)
+                self._active_requests_condition.notify_all()
+
+    def shutdown(self) -> None:
+        """Stop accepting clients and finish cleanup for active connections."""
+        super().shutdown()
+        with self._active_requests_condition:
+            active_requests = tuple(self._active_requests)
+
+        for request in active_requests:
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        with self._active_requests_condition:
+            while self._active_requests:
+                self._active_requests_condition.wait()
 
 
 def create_server(config: Config) -> CollectorServer:
@@ -83,12 +130,18 @@ def run_server(config: Config) -> None:
             for received_signal in signals
         }
         shutdown_handler = create_shutdown_handler(server)
+        serve_forever_started = False
 
         try:
             for received_signal in signals:
                 signal.signal(received_signal, shutdown_handler)
             LOGGER.info("Listening on %s:%s", *server.server_address)
+            serve_forever_started = True
             server.serve_forever()
         finally:
-            for received_signal, previous_handler in previous_handlers.items():
-                signal.signal(received_signal, previous_handler)
+            try:
+                if serve_forever_started:
+                    server.shutdown()
+            finally:
+                for received_signal, previous_handler in previous_handlers.items():
+                    signal.signal(received_signal, previous_handler)
