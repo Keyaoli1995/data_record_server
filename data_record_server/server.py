@@ -1,6 +1,8 @@
 """Concurrent TCP server for recording raw client byte streams."""
 
+import errno
 import logging
+import os
 import signal
 import socket
 import socketserver
@@ -12,7 +14,6 @@ from .storage import Storage
 
 
 LOGGER = logging.getLogger(__name__)
-_SHUTDOWN_SIGNALS = frozenset((signal.SIGINT, signal.SIGTERM))
 
 
 class CollectorRequestHandler(socketserver.BaseRequestHandler):
@@ -66,9 +67,12 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.read_buffer_bytes = read_buffer_bytes
         self._active_requests = set()
         self._active_requests_condition = threading.Condition()
-        self._shutdown_worker = None
-        self._shutdown_worker_lock = threading.RLock()
+        self._shutdown_coordinator = None
+        self._shutdown_coordinator_lock = threading.Lock()
+        self._shutdown_pipe_close_lock = threading.Lock()
         super().__init__(server_address, CollectorRequestHandler)
+        self._shutdown_pipe_read_fd, self._shutdown_pipe_write_fd = os.pipe()
+        os.set_blocking(self._shutdown_pipe_write_fd, False)
 
     def process_request(self, request, client_address) -> None:
         """Track a request before starting its worker thread."""
@@ -106,26 +110,76 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             while self._active_requests:
                 self._active_requests_condition.wait()
 
-    def register_shutdown_worker(self, worker) -> bool:
-        """Keep ownership of the first signal-triggered shutdown worker."""
-        with self._shutdown_worker_lock:
-            if self._shutdown_worker is not None:
+    def start_shutdown_coordinator(self) -> bool:
+        """Start the single worker that coordinates signal-triggered shutdown."""
+        with self._shutdown_coordinator_lock:
+            if self._shutdown_coordinator is not None:
                 return False
-            self._shutdown_worker = worker
-            return True
+            worker = threading.Thread(
+                target=self._run_shutdown_coordinator,
+                daemon=True,
+            )
+            self._shutdown_coordinator = worker
 
-    def wait_for_shutdown_worker(self) -> None:
-        """Wait for the signal-triggered shutdown worker when called externally."""
-        with self._shutdown_worker_lock:
-            worker = self._shutdown_worker
+        try:
+            worker.start()
+        except BaseException:
+            with self._shutdown_coordinator_lock:
+                if self._shutdown_coordinator is worker:
+                    self._shutdown_coordinator = None
+            raise
+        return True
+
+    def notify_shutdown(self) -> None:
+        """Request shutdown without allocating or synchronizing in a signal handler."""
+        write_fd = self._shutdown_pipe_write_fd
+        if write_fd is None:
+            return
+        try:
+            os.write(write_fd, b"\x00")
+        except BlockingIOError:
+            return
+        except OSError as error:
+            if error.errno == errno.EBADF:
+                return
+            raise
+
+    def wait_for_shutdown_coordinator(self) -> None:
+        """Wait for the shutdown coordinator when called from another thread."""
+        with self._shutdown_coordinator_lock:
+            worker = self._shutdown_coordinator
         if worker is not None and worker is not threading.current_thread():
             worker.join()
 
-    def clear_shutdown_worker(self, worker) -> None:
-        """Release ownership when a registered worker cannot be started."""
-        with self._shutdown_worker_lock:
-            if self._shutdown_worker is worker:
-                self._shutdown_worker = None
+    def server_close(self) -> None:
+        """Stop the coordinator and close the self-pipe exactly once."""
+        try:
+            self.notify_shutdown()
+            self.wait_for_shutdown_coordinator()
+            super().server_close()
+        finally:
+            self._close_shutdown_pipe()
+
+    def _run_shutdown_coordinator(self) -> None:
+        try:
+            notification = os.read(self._shutdown_pipe_read_fd, 1)
+        except OSError as error:
+            if error.errno == errno.EBADF:
+                return
+            raise
+        if notification:
+            self.shutdown()
+
+    def _close_shutdown_pipe(self) -> None:
+        with self._shutdown_pipe_close_lock:
+            read_fd = self._shutdown_pipe_read_fd
+            write_fd = self._shutdown_pipe_write_fd
+            self._shutdown_pipe_read_fd = None
+            self._shutdown_pipe_write_fd = None
+        if write_fd is not None:
+            os.close(write_fd)
+        if read_fd is not None:
+            os.close(read_fd)
 
 
 def create_server(config: Config) -> CollectorServer:
@@ -138,24 +192,8 @@ def create_server(config: Config) -> CollectorServer:
 def create_shutdown_handler(server: CollectorServer) -> Callable[[int, object], None]:
     """Create a signal handler that requests a server shutdown safely."""
 
-    def shutdown_handler(signum: int, _frame: object) -> None:
-        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
-        try:
-            LOGGER.info("Received signal %s; shutting down", signum)
-            worker = threading.Thread(target=server.shutdown, daemon=True)
-            register_shutdown_worker = getattr(server, "register_shutdown_worker", None)
-            if register_shutdown_worker is None or register_shutdown_worker(worker):
-                try:
-                    worker.start()
-                except BaseException:
-                    clear_shutdown_worker = getattr(
-                        server, "clear_shutdown_worker", None
-                    )
-                    if clear_shutdown_worker is not None:
-                        clear_shutdown_worker(worker)
-                    raise
-        finally:
-            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    def shutdown_handler(_signum: int, _frame: object) -> None:
+        server.notify_shutdown()
 
     return shutdown_handler
 
@@ -169,19 +207,20 @@ def run_server(config: Config) -> None:
             for received_signal in signals
         }
         shutdown_handler = create_shutdown_handler(server)
-        serve_forever_started = False
+        coordinator_started = False
 
         try:
+            server.start_shutdown_coordinator()
+            coordinator_started = True
             for received_signal in signals:
                 signal.signal(received_signal, shutdown_handler)
             LOGGER.info("Listening on %s:%s", *server.server_address)
-            serve_forever_started = True
             server.serve_forever()
         finally:
             try:
-                if serve_forever_started:
-                    server.shutdown()
-                    server.wait_for_shutdown_worker()
+                if coordinator_started:
+                    server.notify_shutdown()
+                    server.wait_for_shutdown_coordinator()
             finally:
                 for received_signal, previous_handler in previous_handlers.items():
                     signal.signal(received_signal, previous_handler)
