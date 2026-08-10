@@ -69,6 +69,10 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self._active_requests_condition = threading.Condition()
         self._shutdown_coordinator = None
         self._shutdown_coordinator_lock = threading.Lock()
+        self._shutdown_coordinator_state = threading.Condition()
+        self._serve_loop_ready = False
+        self._serve_loop_completed = False
+        self._shutdown_coordinator_cancelled = False
         self._shutdown_pipe_close_lock = threading.Lock()
         super().__init__(server_address, CollectorRequestHandler)
         self._shutdown_pipe_read_fd, self._shutdown_pipe_write_fd = os.pipe()
@@ -110,6 +114,21 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             while self._active_requests:
                 self._active_requests_condition.wait()
 
+    def serve_forever(self, poll_interval: float = 0.5) -> None:
+        """Run the base server after making coordinator shutdown safe."""
+        self._BaseServer__is_shut_down.clear()
+        with self._shutdown_coordinator_state:
+            self._serve_loop_ready = True
+            self._serve_loop_completed = False
+            self._shutdown_coordinator_state.notify_all()
+        try:
+            super().serve_forever(poll_interval)
+        finally:
+            with self._shutdown_coordinator_state:
+                self._serve_loop_ready = False
+                self._serve_loop_completed = True
+                self._shutdown_coordinator_state.notify_all()
+
     def start_shutdown_coordinator(self) -> bool:
         """Start the single worker that coordinates signal-triggered shutdown."""
         with self._shutdown_coordinator_lock:
@@ -144,6 +163,13 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
                 return
             raise
 
+    def cancel_shutdown_coordinator(self) -> None:
+        """Wake the coordinator without allowing a pre-serve shutdown call."""
+        with self._shutdown_coordinator_state:
+            self._shutdown_coordinator_cancelled = True
+            self._shutdown_coordinator_state.notify_all()
+        self.notify_shutdown()
+
     def wait_for_shutdown_coordinator(self) -> None:
         """Wait for the shutdown coordinator when called from another thread."""
         with self._shutdown_coordinator_lock:
@@ -154,7 +180,7 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     def server_close(self) -> None:
         """Stop the coordinator and close the self-pipe exactly once."""
         try:
-            self.notify_shutdown()
+            self.cancel_shutdown_coordinator()
             self.wait_for_shutdown_coordinator()
             super().server_close()
         finally:
@@ -167,8 +193,21 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             if error.errno == errno.EBADF:
                 return
             raise
-        if notification:
-            self.shutdown()
+        if not notification:
+            return
+        with self._shutdown_coordinator_state:
+            while (
+                not self._serve_loop_ready
+                and not self._serve_loop_completed
+                and not self._shutdown_coordinator_cancelled
+            ):
+                self._shutdown_coordinator_state.wait()
+            if (
+                self._shutdown_coordinator_cancelled
+                or self._serve_loop_completed
+            ):
+                return
+        self.shutdown()
 
     def _close_shutdown_pipe(self) -> None:
         with self._shutdown_pipe_close_lock:
@@ -176,10 +215,17 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             write_fd = self._shutdown_pipe_write_fd
             self._shutdown_pipe_read_fd = None
             self._shutdown_pipe_write_fd = None
-        if write_fd is not None:
-            os.close(write_fd)
-        if read_fd is not None:
-            os.close(read_fd)
+        first_error = None
+        for file_descriptor in (write_fd, read_fd):
+            if file_descriptor is None:
+                continue
+            try:
+                os.close(file_descriptor)
+            except OSError as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
 
 
 def create_server(config: Config) -> CollectorServer:
@@ -208,6 +254,7 @@ def run_server(config: Config) -> None:
         }
         shutdown_handler = create_shutdown_handler(server)
         coordinator_started = False
+        serve_forever_started = False
 
         try:
             server.start_shutdown_coordinator()
@@ -215,11 +262,15 @@ def run_server(config: Config) -> None:
             for received_signal in signals:
                 signal.signal(received_signal, shutdown_handler)
             LOGGER.info("Listening on %s:%s", *server.server_address)
+            serve_forever_started = True
             server.serve_forever()
         finally:
             try:
                 if coordinator_started:
-                    server.notify_shutdown()
+                    if serve_forever_started:
+                        server.notify_shutdown()
+                    else:
+                        server.cancel_shutdown_coordinator()
                     server.wait_for_shutdown_coordinator()
             finally:
                 for received_signal, previous_handler in previous_handlers.items():
