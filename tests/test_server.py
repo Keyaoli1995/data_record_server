@@ -191,6 +191,7 @@ class CollectorServerTest(unittest.TestCase):
         serve_error = RuntimeError("serve loop failed")
         failure_requested = threading.Event()
         client_recorded = threading.Event()
+        client_finished = threading.Event()
         allow_client_receive = threading.Event()
         client_result = []
         server = create_server(
@@ -224,6 +225,9 @@ class CollectorServerTest(unittest.TestCase):
                     client_result.append(client.recv(1))
             except BaseException as error:
                 client_result.append(error)
+            finally:
+                failure_requested.set()
+                client_finished.set()
 
         server.service_actions = service_actions
         client_thread = threading.Thread(target=run_client)
@@ -240,7 +244,9 @@ class CollectorServerTest(unittest.TestCase):
                     run_server(Config("127.0.0.1", 0, self._data_dir, 4))
 
             self.assertIs(serve_error, caught.exception)
-            self.assertTrue(client_recorded.is_set())
+            if not client_recorded.is_set():
+                self.assertTrue(client_finished.wait(timeout=2))
+                self.fail(f"client thread failed before recording bytes: {client_result!r}")
             self._wait_for(
                 lambda: any(
                     event["event"] == "disconnected"
@@ -253,7 +259,8 @@ class CollectorServerTest(unittest.TestCase):
             allow_client_receive.set()
             client_thread.join(timeout=2)
             self.assertFalse(client_thread.is_alive())
-            self.assertEqual([b""], client_result)
+            self.assertTrue(client_finished.is_set())
+            self.assertEqual([b""], client_result, f"client thread failed: {client_result!r}")
             server.wait_for_shutdown_coordinator()
         finally:
             allow_client_receive.set()
