@@ -62,7 +62,7 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
     def __init__(
         self,
-        address: ServerAddress,
+        server_address: ServerAddress,
         storage: Storage,
         read_buffer_bytes: int,
     ) -> None:
@@ -77,7 +77,7 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self._serve_loop_completed = False
         self._shutdown_coordinator_cancelled = False
         self._shutdown_pipe_close_lock = threading.Lock()
-        super().__init__(address, CollectorRequestHandler)
+        super().__init__(server_address, CollectorRequestHandler)
         self._shutdown_pipe_read_fd, self._shutdown_pipe_write_fd = os.pipe()
         os.set_blocking(self._shutdown_pipe_write_fd, False)
 
