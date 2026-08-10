@@ -6,6 +6,7 @@ import os
 import signal
 import socket
 import socketserver
+import sys
 import threading
 from typing import Callable, Tuple
 
@@ -189,10 +190,27 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     def server_close(self) -> None:
         """Stop the coordinator and close the self-pipe exactly once."""
         if self._construction_in_progress:
+            primary_error = sys.exc_info()[1]
+            tcp_close_error = None
             try:
                 super().server_close()
-            finally:
-                self._close_shutdown_pipe_preserving_primary_error()
+            except BaseException as error:
+                if primary_error is None:
+                    tcp_close_error = error
+                else:
+                    self._log_cleanup_failure(
+                        "Failed to close TCP socket during construction"
+                    )
+            try:
+                self._close_shutdown_pipe()
+            except BaseException:
+                if primary_error is None and tcp_close_error is None:
+                    raise
+                self._log_cleanup_failure(
+                    "Failed to close TCP shutdown pipe during construction"
+                )
+            if tcp_close_error is not None:
+                raise tcp_close_error
             return
         try:
             self.cancel_shutdown_coordinator()
@@ -243,12 +261,16 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         try:
             self._close_shutdown_pipe()
         except BaseException:
-            try:
-                LOGGER.exception(
-                    "Failed to close TCP shutdown pipe during construction"
-                )
-            except BaseException:
-                pass
+            self._log_cleanup_failure(
+                "Failed to close TCP shutdown pipe during construction"
+            )
+
+    @staticmethod
+    def _log_cleanup_failure(message: str) -> None:
+        try:
+            LOGGER.exception(message)
+        except BaseException:
+            pass
 
 
 def create_server(config: Config) -> CollectorServer:
