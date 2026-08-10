@@ -318,6 +318,91 @@ with tempfile.TemporaryDirectory() as directory:
                 process.wait(timeout=2)
             process.stderr.close()
 
+    def test_nested_sigterm_does_not_replace_the_registered_shutdown_worker(self):
+        child_code = """
+import inspect
+import os
+import signal
+import sys
+import tempfile
+
+import data_record_server.server as server_module
+from data_record_server.server import CollectorServer, create_shutdown_handler
+from data_record_server.storage import Storage
+
+
+class Worker:
+    def __init__(self, *, target, daemon):
+        self.target = target
+        self.daemon = daemon
+
+    def start(self):
+        started.append(self)
+
+
+started = []
+injected = [False]
+source_lines, source_start_line = inspect.getsourcelines(
+    CollectorServer.register_shutdown_worker
+)
+assignment_line = next(
+    source_start_line + offset
+    for offset, line in enumerate(source_lines)
+    if "self._shutdown_worker = worker" in line
+)
+
+
+def trace(frame, event, _argument):
+    if (
+        event == "line"
+        and frame.f_code is CollectorServer.register_shutdown_worker.__code__
+        and frame.f_lineno == assignment_line
+        and not injected[0]
+    ):
+        injected[0] = True
+        os.kill(os.getpid(), signal.SIGTERM)
+    return trace
+
+
+with tempfile.TemporaryDirectory() as directory:
+    server = CollectorServer(("127.0.0.1", 0), Storage(directory), 4)
+    try:
+        server.shutdown = lambda: None
+        server_module.threading.Thread = Worker
+        signal.signal(signal.SIGTERM, create_shutdown_handler(server))
+        sys.settrace(trace)
+        os.kill(os.getpid(), signal.SIGTERM)
+        sys.settrace(None)
+        assert injected[0]
+        assert len(started) == 1, len(started)
+        assert server._shutdown_worker is started[0]
+    finally:
+        server.server_close()
+"""
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+        process = subprocess.Popen(
+            [sys.executable, "-c", child_code],
+            cwd=Path(__file__).resolve().parents[1],
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+                self.fail("nested SIGTERM test process did not exit before the deadline")
+            self.assertEqual(0, process.returncode, process.stderr.read())
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+            process.stderr.close()
+
     @mock.patch("data_record_server.server.threading.Thread")
     def test_shutdown_handler_clears_a_worker_when_start_fails(self, thread_class):
         first_worker = mock.Mock()
