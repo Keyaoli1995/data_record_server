@@ -1,5 +1,6 @@
 """Integration tests for the concurrent raw TCP collector server."""
 
+import errno
 import json
 import os
 import signal
@@ -54,6 +55,72 @@ class CollectorServerTest(unittest.TestCase):
             self.assertEqual("127.0.0.1", server.server_address[0])
         finally:
             server.server_close()
+
+    def test_constructor_closes_shutdown_pipe_when_nonblocking_setup_fails(self):
+        setup_error = RuntimeError("nonblocking setup failed")
+        captured_file_descriptors = []
+        real_pipe = os.pipe
+
+        def capture_pipe():
+            file_descriptors = real_pipe()
+            captured_file_descriptors.extend(file_descriptors)
+            return file_descriptors
+
+        try:
+            with mock.patch(
+                "data_record_server.server.os.pipe", side_effect=capture_pipe
+            ), mock.patch(
+                "data_record_server.server.os.set_blocking", side_effect=setup_error
+            ):
+                with self.assertRaises(RuntimeError) as caught:
+                    CollectorServer(
+                        ("127.0.0.1", 0), Storage(self._data_dir), 4
+                    )
+
+            self.assertIs(setup_error, caught.exception)
+            self.assertEqual(2, len(captured_file_descriptors))
+            self._assert_file_descriptors_closed(captured_file_descriptors)
+        finally:
+            self._close_file_descriptors(captured_file_descriptors)
+
+    def test_constructor_closes_shutdown_pipe_when_tcp_bind_fails(self):
+        captured_file_descriptors = []
+        captured_bind_errors = []
+        real_pipe = os.pipe
+        real_server_bind = CollectorServer.server_bind
+
+        def capture_pipe():
+            file_descriptors = real_pipe()
+            captured_file_descriptors.extend(file_descriptors)
+            return file_descriptors
+
+        def capture_bind_error(server):
+            try:
+                real_server_bind(server)
+            except OSError as error:
+                captured_bind_errors.append(error)
+                raise
+
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied_socket:
+                occupied_socket.bind(("127.0.0.1", 0))
+                occupied_socket.listen()
+                with mock.patch(
+                    "data_record_server.server.os.pipe", side_effect=capture_pipe
+                ), mock.patch.object(
+                    CollectorServer, "server_bind", capture_bind_error
+                ):
+                    with self.assertRaises(OSError) as caught:
+                        CollectorServer(
+                            occupied_socket.getsockname(), Storage(self._data_dir), 4
+                        )
+
+            self.assertEqual(1, len(captured_bind_errors))
+            self.assertIs(captured_bind_errors[0], caught.exception)
+            self.assertEqual(2, len(captured_file_descriptors))
+            self._assert_file_descriptors_closed(captured_file_descriptors)
+        finally:
+            self._close_file_descriptors(captured_file_descriptors)
 
     def test_records_complete_stream_and_receive_metadata(self):
         with socket.create_connection(self._server.server_address, timeout=2) as client:
@@ -786,6 +853,21 @@ with tempfile.TemporaryDirectory() as directory:
 
     def _read_events(self):
         return self._read_events_from(self._data_dir)
+
+    def _assert_file_descriptors_closed(self, file_descriptors):
+        for file_descriptor in file_descriptors:
+            with self.assertRaises(OSError) as caught:
+                os.fstat(file_descriptor)
+            self.assertEqual(errno.EBADF, caught.exception.errno)
+
+    @staticmethod
+    def _close_file_descriptors(file_descriptors):
+        for file_descriptor in file_descriptors:
+            try:
+                os.close(file_descriptor)
+            except OSError as error:
+                if error.errno != errno.EBADF:
+                    raise
 
     def _disconnected_count(self):
         return sum(
