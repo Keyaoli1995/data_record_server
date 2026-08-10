@@ -5,7 +5,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Tuple
+from typing import Callable, Dict, Tuple
 
 Clock = Callable[[], datetime]
 ClientAddress = Tuple[str, int]
@@ -28,7 +28,7 @@ class JsonlEventWriter:
         self._path = Path(path)
         self._lock = threading.Lock()
 
-    def write(self, event: dict) -> None:
+    def write(self, event: Dict[str, object]) -> None:
         line = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
         with self._lock:
             with self._path.open("a", encoding="utf-8") as stream:
@@ -60,15 +60,26 @@ class ConnectionRecorder:
         self._closed = False
         self._close_lock = threading.Lock()
 
-        self._write_event(
-            {
-                "event": "connected",
-                "time": timestamp,
-                "file": self.relative_path,
-                "client_ip": client_ip,
-                "client_port": client_port,
-            }
-        )
+        try:
+            self._write_event(
+                {
+                    "event": "connected",
+                    "time": timestamp,
+                    "file": self.relative_path,
+                    "client_ip": client_ip,
+                    "client_port": client_port,
+                }
+            )
+        except BaseException:
+            try:
+                self._stream.close()
+            except BaseException:
+                pass
+            try:
+                self.path.unlink()
+            except BaseException:
+                pass
+            raise
 
     def record_received(self, data: bytes) -> None:
         self._stream.write(data)
@@ -110,7 +121,7 @@ class ConnectionRecorder:
                 }
             )
 
-    def _write_event(self, event: dict) -> None:
+    def _write_event(self, event: Dict[str, object]) -> None:
         self._events.write(event)
 
 
