@@ -11,6 +11,8 @@ from pathlib import Path
 
 import yaml
 
+from data_record_server.storage import Storage
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_UID = "10001"
@@ -162,6 +164,11 @@ class DeploymentFilesTest(unittest.TestCase):
         shutil.copy2(script, copied_script)
         return repository, copied_script
 
+    def _collector_identity(self):
+        if os.getuid() == 0:
+            return 10001, 10001
+        return os.getuid(), os.getgid()
+
     def test_prepare_data_dir_script_is_anchored_and_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             repository, script = self._copy_preparation_script(temporary_directory)
@@ -170,10 +177,11 @@ class DeploymentFilesTest(unittest.TestCase):
             sample_file.parent.mkdir(parents=True)
             sample_file.write_bytes(b"captured bytes")
             external_data_dir = Path(temporary_directory) / "external-data"
+            collector_uid, collector_gid = self._collector_identity()
             environment = os.environ | {
                 "DATA_DIR": str(external_data_dir),
-                "COLLECTOR_UID": str(os.getuid()),
-                "COLLECTOR_GID": str(os.getgid()),
+                "COLLECTOR_UID": str(collector_uid),
+                "COLLECTOR_GID": str(collector_gid),
             }
             first_result = subprocess.run(
                 [str(script)],
@@ -198,11 +206,59 @@ class DeploymentFilesTest(unittest.TestCase):
             self.assertFalse(external_data_dir.exists())
             data_stat = data_dir.stat()
             self.assertTrue(data_dir.is_dir())
-            self.assertEqual(os.getuid(), data_stat.st_uid)
-            self.assertEqual(os.getgid(), data_stat.st_gid)
+            self.assertEqual(collector_uid, data_stat.st_uid)
+            self.assertEqual(collector_gid, data_stat.st_gid)
             self.assertEqual(0o750, stat.S_IMODE(data_stat.st_mode))
             self.assertEqual(b"captured bytes", sample_file.read_bytes())
             self.assertTrue(os.access(sample_file, os.R_OK | os.W_OK))
+
+    def test_prepare_data_dir_repairs_key_paths_for_storage(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository, script = self._copy_preparation_script(temporary_directory)
+            data_dir = repository / "data"
+            connections_dir = data_dir / "connections"
+            connections_dir.mkdir(parents=True)
+            events_file = data_dir / "events.jsonl"
+            sentinel_events = b'{"event":"existing"}\n'
+            events_file.write_bytes(sentinel_events)
+            connections_dir.chmod(0o500)
+            events_file.chmod(0o400)
+            collector_uid, collector_gid = self._collector_identity()
+            result = subprocess.run(
+                [str(script)],
+                cwd=repository,
+                env=os.environ
+                | {
+                    "COLLECTOR_UID": str(collector_uid),
+                    "COLLECTOR_GID": str(collector_gid),
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual(0o750, stat.S_IMODE(data_dir.stat().st_mode))
+            self.assertEqual(0o750, stat.S_IMODE(connections_dir.stat().st_mode))
+            self.assertEqual(0o640, stat.S_IMODE(events_file.stat().st_mode))
+            for path in (data_dir, connections_dir, events_file):
+                path_stat = path.stat()
+                self.assertEqual(collector_uid, path_stat.st_uid)
+                self.assertEqual(collector_gid, path_stat.st_gid)
+            self.assertEqual(sentinel_events, events_file.read_bytes())
+
+            storage = Storage(data_dir)
+            recorder = storage.open_connection(("127.0.0.1", 30050))
+            recorder.record_received(b"probe bytes")
+            recorder.close()
+
+            connection_files = list(connections_dir.glob("*.bin"))
+            self.assertEqual(1, len(connection_files))
+            self.assertEqual(b"probe bytes", connection_files[0].read_bytes())
+            updated_events = events_file.read_bytes()
+            self.assertTrue(updated_events.startswith(sentinel_events))
+            self.assertGreater(len(updated_events), len(sentinel_events))
 
     def test_prepare_data_dir_script_refuses_a_data_symlink(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -213,14 +269,15 @@ class DeploymentFilesTest(unittest.TestCase):
             sentinel_file.write_bytes(b"sentinel")
             sentinel_stat = sentinel_directory.stat()
             (repository / "data").symlink_to(sentinel_directory, target_is_directory=True)
+            collector_uid, collector_gid = self._collector_identity()
 
             result = subprocess.run(
                 [str(script)],
                 cwd=repository,
                 env=os.environ
                 | {
-                    "COLLECTOR_UID": str(os.getuid()),
-                    "COLLECTOR_GID": str(os.getgid()),
+                    "COLLECTOR_UID": str(collector_uid),
+                    "COLLECTOR_GID": str(collector_gid),
                 },
                 capture_output=True,
                 text=True,
@@ -229,6 +286,7 @@ class DeploymentFilesTest(unittest.TestCase):
             )
 
             self.assertNotEqual(0, result.returncode)
+            self.assertIn("symlink", result.stderr.lower())
             self.assertEqual(b"sentinel", sentinel_file.read_bytes())
             updated_sentinel_stat = sentinel_directory.stat()
             self.assertEqual(sentinel_stat.st_uid, updated_sentinel_stat.st_uid)
@@ -237,6 +295,96 @@ class DeploymentFilesTest(unittest.TestCase):
                 stat.S_IMODE(sentinel_stat.st_mode),
                 stat.S_IMODE(updated_sentinel_stat.st_mode),
             )
+
+    def test_prepare_data_dir_script_rejects_unsafe_key_paths(self):
+        for path_kind in ("connections-symlink", "events-symlink", "events-directory"):
+            with self.subTest(path_kind=path_kind), tempfile.TemporaryDirectory() as temporary_directory:
+                repository, script = self._copy_preparation_script(temporary_directory)
+                data_dir = repository / "data"
+                data_dir.mkdir()
+                connections_dir = data_dir / "connections"
+                events_file = data_dir / "events.jsonl"
+                external_path = Path(temporary_directory) / "external"
+                if path_kind == "connections-symlink":
+                    external_path.mkdir()
+                    sentinel_file = external_path / "sentinel.bin"
+                    sentinel_file.write_bytes(b"outside")
+                    connections_dir.symlink_to(external_path, target_is_directory=True)
+                elif path_kind == "events-symlink":
+                    connections_dir.mkdir()
+                    external_path.write_bytes(b"outside")
+                    sentinel_file = external_path
+                    events_file.symlink_to(external_path)
+                else:
+                    connections_dir.mkdir()
+                    events_file.mkdir()
+                    sentinel_file = events_file / "sentinel.bin"
+                    sentinel_file.write_bytes(b"inside unexpected object")
+                sentinel_stat = sentinel_file.stat()
+                sentinel_bytes = sentinel_file.read_bytes()
+                collector_uid, collector_gid = self._collector_identity()
+
+                result = subprocess.run(
+                    [str(script)],
+                    cwd=repository,
+                    env=os.environ
+                    | {
+                        "COLLECTOR_UID": str(collector_uid),
+                        "COLLECTOR_GID": str(collector_gid),
+                    },
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+
+                self.assertNotEqual(0, result.returncode)
+                self.assertEqual(sentinel_bytes, sentinel_file.read_bytes())
+                updated_sentinel_stat = sentinel_file.stat()
+                self.assertEqual(sentinel_stat.st_uid, updated_sentinel_stat.st_uid)
+                self.assertEqual(sentinel_stat.st_gid, updated_sentinel_stat.st_gid)
+                self.assertEqual(
+                    stat.S_IMODE(sentinel_stat.st_mode),
+                    stat.S_IMODE(updated_sentinel_stat.st_mode),
+                )
+
+    def test_prepare_data_dir_script_rejects_root_collector_identity(self):
+        for environment_override in (
+            {"COLLECTOR_UID": "0", "COLLECTOR_GID": "10001"},
+            {"COLLECTOR_UID": "10001", "COLLECTOR_GID": "0"},
+        ):
+            with self.subTest(environment_override=environment_override), tempfile.TemporaryDirectory() as temporary_directory:
+                repository, script = self._copy_preparation_script(temporary_directory)
+                data_dir = repository / "data"
+                connections_dir = data_dir / "connections"
+                connections_dir.mkdir(parents=True)
+                events_file = data_dir / "events.jsonl"
+                events_file.write_bytes(b'{"event":"sentinel"}\n')
+                original_stats = {
+                    path: path.stat() for path in (data_dir, connections_dir, events_file)
+                }
+
+                result = subprocess.run(
+                    [str(script)],
+                    cwd=repository,
+                    env=os.environ | environment_override,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("must identify a non-root", result.stderr)
+                self.assertEqual(b'{"event":"sentinel"}\n', events_file.read_bytes())
+                for path, original_stat in original_stats.items():
+                    updated_stat = path.stat()
+                    self.assertEqual(original_stat.st_uid, updated_stat.st_uid)
+                    self.assertEqual(original_stat.st_gid, updated_stat.st_gid)
+                    self.assertEqual(
+                        stat.S_IMODE(original_stat.st_mode),
+                        stat.S_IMODE(updated_stat.st_mode),
+                    )
 
     def test_rejects_existing_tree_with_mismatched_ownership_without_root(self):
         script_source = (PROJECT_ROOT / "scripts" / "prepare-data-dir.sh").read_text(
@@ -255,12 +403,20 @@ class DeploymentFilesTest(unittest.TestCase):
             connections_dir.mkdir()
             sample_file = connections_dir / "sample.bin"
             sample_file.write_bytes(b"captured bytes")
+            connections_dir.chmod(0o500)
+            sample_file.chmod(0o440)
+            events_file = data_dir / "events.jsonl"
+            events_file.write_bytes(b'{"event":"existing"}\n')
+            events_file.chmod(0o400)
             original_stats = {
-                path: path.stat() for path in (data_dir, connections_dir, sample_file)
+                path: path.stat()
+                for path in (data_dir, connections_dir, sample_file, events_file)
             }
+            target_uid = 10001 if os.getuid() == 0 else os.getuid() + 1
+            target_gid = 10001 if os.getuid() == 0 else os.getgid() + 1
             environment = os.environ | {
-                "COLLECTOR_UID": "10001",
-                "COLLECTOR_GID": "10001",
+                "COLLECTOR_UID": str(target_uid),
+                "COLLECTOR_GID": str(target_gid),
             }
             first_result = subprocess.run(
                 [str(script)],
@@ -285,14 +441,20 @@ class DeploymentFilesTest(unittest.TestCase):
                     )
                     self.assertEqual(0, first_result.returncode, first_result.stderr)
                     self.assertEqual(0, second_result.returncode, second_result.stderr)
-                    for path in (data_dir, connections_dir, sample_file):
+                    for path in (data_dir, connections_dir, sample_file, events_file):
                         path_stat = path.stat()
-                        self.assertEqual(10001, path_stat.st_uid)
-                        self.assertEqual(10001, path_stat.st_gid)
+                        self.assertEqual(target_uid, path_stat.st_uid)
+                        self.assertEqual(target_gid, path_stat.st_gid)
                     self.assertEqual(0o750, stat.S_IMODE(data_dir.stat().st_mode))
+                    self.assertEqual(
+                        0o750, stat.S_IMODE(connections_dir.stat().st_mode)
+                    )
+                    self.assertEqual(0o640, stat.S_IMODE(events_file.stat().st_mode))
+                    self.assertEqual(0o440, stat.S_IMODE(sample_file.stat().st_mode))
                     self.assertEqual(b"captured bytes", sample_file.read_bytes())
+                    self.assertEqual(b'{"event":"existing"}\n', events_file.read_bytes())
                 finally:
-                    for path in (sample_file, connections_dir, data_dir):
+                    for path in (sample_file, events_file, connections_dir, data_dir):
                         os.chown(path, os.getuid(), os.getgid())
             else:
                 self.assertNotEqual(0, first_result.returncode)
