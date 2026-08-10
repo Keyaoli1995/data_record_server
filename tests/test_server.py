@@ -45,16 +45,7 @@ class CollectorServerTest(unittest.TestCase):
             client.shutdown(socket.SHUT_WR)
             self.assertEqual(b"", client.recv(1))
 
-        self._wait_for(
-            lambda: len(
-                [
-                    event
-                    for event in self._read_events()
-                    if event["event"] == "disconnected"
-                ]
-            )
-            == 1
-        )
+        self._wait_for(lambda: self._disconnected_count() == 1)
 
         connection_files = list((self._data_dir / "connections").glob("*.bin"))
         self.assertEqual(1, len(connection_files))
@@ -90,16 +81,7 @@ class CollectorServerTest(unittest.TestCase):
                 second_client.shutdown(socket.SHUT_WR)
                 self.assertEqual(b"", second_client.recv(1))
 
-            self._wait_for(
-                lambda: len(
-                    [
-                        event
-                        for event in self._read_events()
-                        if event["event"] == "disconnected"
-                    ]
-                )
-                == 1
-            )
+            self._wait_for(lambda: self._disconnected_count() == 1)
             completed_file = next(
                 event["file"]
                 for event in self._read_events()
@@ -107,16 +89,7 @@ class CollectorServerTest(unittest.TestCase):
             )
             self.assertEqual(b"second", (self._data_dir / completed_file).read_bytes())
 
-        self._wait_for(
-            lambda: len(
-                [
-                    event
-                    for event in self._read_events()
-                    if event["event"] == "disconnected"
-                ]
-            )
-            == 2
-        )
+        self._wait_for(lambda: self._disconnected_count() == 2)
         connection_files = list((self._data_dir / "connections").glob("*.bin"))
         self.assertEqual(2, len(connection_files))
         self.assertEqual(
@@ -797,6 +770,11 @@ with tempfile.TemporaryDirectory() as directory:
 
     def _read_events(self):
         return self._read_events_from(self._data_dir)
+
+    def _disconnected_count(self):
+        return sum(
+            event["event"] == "disconnected" for event in self._read_events()
+        )
 
     def _assert_child_exits_successfully(self, child_code):
         environment = os.environ.copy()

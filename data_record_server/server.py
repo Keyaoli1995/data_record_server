@@ -7,13 +7,16 @@ import signal
 import socket
 import socketserver
 import threading
-from typing import Callable
+from typing import Callable, Tuple
 
 from .config import Config
 from .storage import Storage
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+ServerAddress = Tuple[str, int]
 
 
 class CollectorRequestHandler(socketserver.BaseRequestHandler):
@@ -59,7 +62,7 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
     def __init__(
         self,
-        server_address: tuple[str, int],
+        address: ServerAddress,
         storage: Storage,
         read_buffer_bytes: int,
     ) -> None:
@@ -74,7 +77,7 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self._serve_loop_completed = False
         self._shutdown_coordinator_cancelled = False
         self._shutdown_pipe_close_lock = threading.Lock()
-        super().__init__(server_address, CollectorRequestHandler)
+        super().__init__(address, CollectorRequestHandler)
         self._shutdown_pipe_read_fd, self._shutdown_pipe_write_fd = os.pipe()
         os.set_blocking(self._shutdown_pipe_write_fd, False)
 
