@@ -158,6 +158,7 @@ class DeploymentFilesTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=5,
             )
             second_result = subprocess.run(
                 [str(script)],
@@ -166,6 +167,7 @@ class DeploymentFilesTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=5,
             )
             self.assertEqual(0, first_result.returncode, first_result.stderr)
             self.assertEqual(0, second_result.returncode, second_result.stderr)
@@ -199,6 +201,7 @@ class DeploymentFilesTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=5,
             )
 
             self.assertNotEqual(0, result.returncode)
@@ -211,7 +214,7 @@ class DeploymentFilesTest(unittest.TestCase):
                 stat.S_IMODE(updated_sentinel_stat.st_mode),
             )
 
-    def test_prepare_data_dir_script_handles_mismatched_ownership_safely(self):
+    def test_rejects_existing_tree_with_mismatched_ownership_without_root(self):
         script_source = (PROJECT_ROOT / "scripts" / "prepare-data-dir.sh").read_text(
             encoding="utf-8"
         )
@@ -224,17 +227,58 @@ class DeploymentFilesTest(unittest.TestCase):
             repository, script = self._copy_preparation_script(temporary_directory)
             data_dir = repository / "data"
             data_dir.mkdir()
-            sample_file = data_dir / "sample.bin"
+            connections_dir = data_dir / "connections"
+            connections_dir.mkdir()
+            sample_file = connections_dir / "sample.bin"
             sample_file.write_bytes(b"captured bytes")
-            result = subprocess.run(
+            original_stats = {
+                path: path.stat() for path in (data_dir, connections_dir, sample_file)
+            }
+            environment = os.environ | {
+                "COLLECTOR_UID": "10001",
+                "COLLECTOR_GID": "10001",
+            }
+            first_result = subprocess.run(
                 [str(script)],
                 cwd=repository,
-                env=os.environ | {"COLLECTOR_UID": "10001", "COLLECTOR_GID": "10001"},
+                env=environment,
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=5,
             )
 
-            self.assertNotEqual(0, result.returncode)
-            self.assertIn("sudo", result.stderr)
-            self.assertEqual(b"captured bytes", sample_file.read_bytes())
+            if os.getuid() == 0:
+                try:
+                    second_result = subprocess.run(
+                        [str(script)],
+                        cwd=repository,
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=5,
+                    )
+                    self.assertEqual(0, first_result.returncode, first_result.stderr)
+                    self.assertEqual(0, second_result.returncode, second_result.stderr)
+                    for path in (data_dir, connections_dir, sample_file):
+                        path_stat = path.stat()
+                        self.assertEqual(10001, path_stat.st_uid)
+                        self.assertEqual(10001, path_stat.st_gid)
+                    self.assertEqual(0o750, stat.S_IMODE(data_dir.stat().st_mode))
+                    self.assertEqual(b"captured bytes", sample_file.read_bytes())
+                finally:
+                    for path in (sample_file, connections_dir, data_dir):
+                        os.chown(path, os.getuid(), os.getgid())
+            else:
+                self.assertNotEqual(0, first_result.returncode)
+                self.assertIn("sudo", first_result.stderr)
+                self.assertEqual(b"captured bytes", sample_file.read_bytes())
+                for path, original_stat in original_stats.items():
+                    updated_stat = path.stat()
+                    self.assertEqual(original_stat.st_uid, updated_stat.st_uid)
+                    self.assertEqual(original_stat.st_gid, updated_stat.st_gid)
+                    self.assertEqual(
+                        stat.S_IMODE(original_stat.st_mode),
+                        stat.S_IMODE(updated_stat.st_mode),
+                    )
