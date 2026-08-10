@@ -202,10 +202,7 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
                 and not self._shutdown_coordinator_cancelled
             ):
                 self._shutdown_coordinator_state.wait()
-            if (
-                self._shutdown_coordinator_cancelled
-                or self._serve_loop_completed
-            ):
+            if self._shutdown_coordinator_cancelled:
                 return
         self.shutdown()
 
