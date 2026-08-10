@@ -1,0 +1,22 @@
+services:
+  collector:
+    build:
+      context: .
+    environment:
+      TCP_HOST: 0.0.0.0
+      TCP_PORT: ${TCP_PORT:-30050}
+      DATA_DIR: /data
+      READ_BUFFER_BYTES: ${READ_BUFFER_BYTES:-4096}
+    ports:
+      - "${TCP_PORT:-30050}:${TCP_PORT:-30050}/tcp"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
