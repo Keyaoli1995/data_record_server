@@ -374,10 +374,27 @@ def trace(frame, event, _argument):
 with tempfile.TemporaryDirectory() as directory:
     server = CollectorServer(("127.0.0.1", 0), Storage(directory), 4)
     try:
-        server.shutdown = lambda: executions.append(1)
         if uses_coordinator:
+            original_shutdown = server.shutdown
+
+            def shutdown():
+                executions.append(1)
+                original_shutdown()
+
+            server.shutdown = shutdown
             server.start_shutdown_coordinator()
             coordinator = server._shutdown_coordinator
+            serve_thread = threading.Thread(target=server.serve_forever)
+            serve_thread.start()
+            for _ in range(100):
+                with server._shutdown_coordinator_state:
+                    if server._serve_loop_ready:
+                        break
+                    server._shutdown_coordinator_state.wait(timeout=0.01)
+            else:
+                raise AssertionError("serve loop did not become ready")
+        else:
+            server.shutdown = lambda: executions.append(1)
         background_thread = threading.Thread(target=background)
         background_thread.start()
         assert background_ready.wait(timeout=1)
@@ -399,6 +416,8 @@ with tempfile.TemporaryDirectory() as directory:
         if uses_coordinator:
             server.wait_for_shutdown_coordinator()
             assert server._shutdown_coordinator is coordinator
+            serve_thread.join(timeout=1)
+            assert not serve_thread.is_alive()
         assert len(executions) == 1, len(executions)
     finally:
         release_background.set()
@@ -430,6 +449,45 @@ with tempfile.TemporaryDirectory() as directory:
                 process.wait(timeout=2)
             process.stderr.close()
 
+    def test_run_server_from_a_non_main_thread_does_not_hang_before_serving(self):
+        child_code = """
+import tempfile
+import threading
+
+from data_record_server.config import Config
+from data_record_server.server import run_server
+
+with tempfile.TemporaryDirectory() as directory:
+    failures = []
+
+    def run():
+        try:
+            run_server(Config("127.0.0.1", 0, directory, 4))
+        except BaseException as error:
+            failures.append(type(error).__name__)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    assert failures == ["ValueError"], failures
+"""
+        self._assert_child_exits_successfully(child_code)
+
+    def test_server_close_cancels_the_coordinator_before_serving(self):
+        child_code = """
+import tempfile
+
+from data_record_server.config import Config
+from data_record_server.server import create_server
+
+with tempfile.TemporaryDirectory() as directory:
+    server = create_server(Config("127.0.0.1", 0, directory, 4))
+    server.start_shutdown_coordinator()
+    server.server_close()
+"""
+        self._assert_child_exits_successfully(child_code)
+
     @mock.patch("data_record_server.server.threading.Thread")
     def test_coordinator_start_failure_allows_a_later_retry(self, thread_class):
         first_worker = mock.Mock()
@@ -451,6 +509,31 @@ with tempfile.TemporaryDirectory() as directory:
 
     def _read_events(self):
         return self._read_events_from(self._data_dir)
+
+    def _assert_child_exits_successfully(self, child_code):
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+        process = subprocess.Popen(
+            [sys.executable, "-c", child_code],
+            cwd=Path(__file__).resolve().parents[1],
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+                self.fail("child process did not exit before the deadline")
+            self.assertEqual(0, process.returncode, process.stderr.read())
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+            process.stderr.close()
 
     @staticmethod
     def _find_free_tcp_port():
