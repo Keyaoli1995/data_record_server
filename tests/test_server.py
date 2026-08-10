@@ -187,6 +187,93 @@ class CollectorServerTest(unittest.TestCase):
                     process.wait(timeout=2)
                 process.stderr.close()
 
+    def test_run_server_waits_for_the_signal_shutdown_worker(self):
+        shutdown_started = threading.Event()
+        allow_shutdown_to_finish = threading.Event()
+        synchronous_shutdown_finished = threading.Event()
+        run_server_returned = threading.Event()
+        previous_handler = object()
+        test_case = self
+
+        class ControlledServer:
+            server_address = ("127.0.0.1", 40123)
+
+            def __init__(self):
+                self._shutdown_worker = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_arguments):
+                return False
+
+            def serve_forever(self):
+                signal_handlers[signal.SIGTERM](signal.SIGTERM, None)
+                test_case.assertTrue(shutdown_started.wait(timeout=1))
+
+            def shutdown(self):
+                if self._shutdown_worker is None:
+                    self._shutdown_worker = threading.current_thread()
+                    shutdown_started.set()
+                    allow_shutdown_to_finish.wait(timeout=2)
+                    return
+                synchronous_shutdown_finished.set()
+
+            def wait_for_shutdown_worker(self):
+                self._shutdown_worker.join(timeout=2)
+
+        controlled_server = ControlledServer()
+        signal_handlers = {}
+
+        def install_signal(received_signal, handler):
+            signal_handlers[received_signal] = handler
+
+        def run():
+            try:
+                from data_record_server.server import run_server
+
+                run_server(
+                    Config(
+                        host="127.0.0.1",
+                        port=40123,
+                        data_dir=self._data_dir,
+                        read_buffer_bytes=4,
+                    )
+                )
+            finally:
+                run_server_returned.set()
+
+        with mock.patch(
+            "data_record_server.server.create_server", return_value=controlled_server
+        ), mock.patch(
+            "data_record_server.server.signal.getsignal", return_value=previous_handler
+        ), mock.patch(
+            "data_record_server.server.signal.signal", side_effect=install_signal
+        ):
+            run_server_thread = threading.Thread(target=run)
+            run_server_thread.start()
+            try:
+                self.assertTrue(synchronous_shutdown_finished.wait(timeout=1))
+                self.assertFalse(run_server_returned.wait(timeout=0.2))
+            finally:
+                allow_shutdown_to_finish.set()
+                run_server_thread.join(timeout=1)
+            self.assertTrue(run_server_returned.is_set())
+            self.assertFalse(run_server_thread.is_alive())
+
+    @mock.patch("data_record_server.server.threading.Thread")
+    def test_shutdown_handler_does_not_replace_a_live_worker(self, thread_class):
+        first_worker = mock.Mock()
+        second_worker = mock.Mock()
+        thread_class.side_effect = [first_worker, second_worker]
+
+        shutdown_handler = create_shutdown_handler(self._server)
+        shutdown_handler(15, None)
+        shutdown_handler(15, None)
+
+        first_worker.start.assert_called_once_with()
+        second_worker.start.assert_not_called()
+
     @mock.patch("data_record_server.server.threading.Thread")
     def test_shutdown_handler_requests_shutdown_from_another_thread(
         self, thread_class
