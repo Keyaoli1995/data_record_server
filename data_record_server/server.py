@@ -77,9 +77,15 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self._serve_loop_completed = False
         self._shutdown_coordinator_cancelled = False
         self._shutdown_pipe_close_lock = threading.Lock()
-        super().__init__(server_address, CollectorRequestHandler)
         self._shutdown_pipe_read_fd, self._shutdown_pipe_write_fd = os.pipe()
-        os.set_blocking(self._shutdown_pipe_write_fd, False)
+        self._construction_in_progress = True
+        try:
+            os.set_blocking(self._shutdown_pipe_write_fd, False)
+            super().__init__(server_address, CollectorRequestHandler)
+        except BaseException:
+            self._close_shutdown_pipe_preserving_primary_error()
+            raise
+        self._construction_in_progress = False
 
     def process_request(self, request, client_address) -> None:
         """Track a request before starting its worker thread."""
@@ -182,6 +188,12 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
     def server_close(self) -> None:
         """Stop the coordinator and close the self-pipe exactly once."""
+        if self._construction_in_progress:
+            try:
+                super().server_close()
+            finally:
+                self._close_shutdown_pipe_preserving_primary_error()
+            return
         try:
             self.cancel_shutdown_coordinator()
             self.wait_for_shutdown_coordinator()
@@ -226,6 +238,17 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
                     first_error = error
         if first_error is not None:
             raise first_error
+
+    def _close_shutdown_pipe_preserving_primary_error(self) -> None:
+        try:
+            self._close_shutdown_pipe()
+        except BaseException:
+            try:
+                LOGGER.exception(
+                    "Failed to close TCP shutdown pipe during construction"
+                )
+            except BaseException:
+                pass
 
 
 def create_server(config: Config) -> CollectorServer:
