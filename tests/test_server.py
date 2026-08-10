@@ -14,7 +14,12 @@ from pathlib import Path
 from unittest import mock
 
 from data_record_server.config import Config
-from data_record_server.server import create_server, create_shutdown_handler
+from data_record_server.server import (
+    CollectorServer,
+    create_server,
+    create_shutdown_handler,
+)
+from data_record_server.storage import Storage
 
 
 class CollectorServerTest(unittest.TestCase):
@@ -38,6 +43,17 @@ class CollectorServerTest(unittest.TestCase):
         self._server_thread.join(timeout=2)
         self.assertFalse(self._server_thread.is_alive())
         self._temporary_directory.cleanup()
+
+    def test_supports_server_address_keyword_construction(self):
+        server = CollectorServer(
+            server_address=("127.0.0.1", 0),
+            storage=Storage(self._data_dir),
+            read_buffer_bytes=4,
+        )
+        try:
+            self.assertEqual("127.0.0.1", server.server_address[0])
+        finally:
+            server.server_close()
 
     def test_records_complete_stream_and_receive_metadata(self):
         with socket.create_connection(self._server.server_address, timeout=2) as client:
