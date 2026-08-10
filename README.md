@@ -36,7 +36,7 @@ sudo scripts/prepare-data-dir.sh
 
 默认部署不需要 `.env`：使用上一节的 `sudo scripts/prepare-data-dir.sh`，再运行 `docker compose up -d --build` 即可，默认值为 `10001:10001` 和 TCP `30050`。
 
-若要自定义 UID/GID 或端口，请在项目根目录创建仅供本机/服务器使用的 `.env`（不要提交该文件）。例如使用本机 `1000:1000` 和 TCP `30100`：
+若要自定义 UID/GID 或端口，请在项目根目录创建仅供本机/服务器使用的 `.env`（不要提交该文件）。即使只修改其中一个值，`.env` 也必须完整定义 `COLLECTOR_UID`、`COLLECTOR_GID` 和 `TCP_PORT` 三项。以下是使用本机 `1000:1000` 和 TCP `30100` 的完整示例：
 
 ```dotenv
 COLLECTOR_UID=1000
@@ -44,17 +44,33 @@ COLLECTOR_GID=1000
 TCP_PORT=30100
 ```
 
-Compose 会自动读取项目根目录的 `.env`，让构建参数、容器 `user`、端口映射和容器内 `TCP_PORT` 使用同一组值。但 `sudo` 不会自动读取它；在**同一个终端会话**中按以下顺序加载并只将已校验的 UID/GID 显式传给脚本：
+Compose 会自动读取项目根目录的 `.env`，让构建参数、容器 `user`、端口映射和容器内 `TCP_PORT` 使用同一组值。但 `sudo` 不会自动读取它。每次进行自定义准备、启动、状态检查或排障时，都在**同一个终端会话**中先运行下面的“安全读取和校验”片段；它不会 `source` 或执行 `.env` 中的内容。
 
 ```bash
-# 只 source 由本项目管理员创建和审阅过的 .env，不要 source 不可信文件。
-set -a
-. ./.env
-set +a
+# 安全读取唯一且非空的 KEY=value；不 source/eval .env 内容。
+read_dotenv_value() {
+  awk -F= -v key="$1" '
+    $1 == key { count++; value = substr($0, length(key) + 2) }
+    END {
+      if (count != 1 || value == "") exit 1
+      print value
+    }
+  ' .env
+}
 
-case "$COLLECTOR_UID" in '' | *[!0-9]*) echo 'COLLECTOR_UID 必须是非负十进制整数'; exit 1;; esac
-case "$COLLECTOR_GID" in '' | *[!0-9]*) echo 'COLLECTOR_GID 必须是非负十进制整数'; exit 1;; esac
+COLLECTOR_UID=$(read_dotenv_value COLLECTOR_UID) || { echo '缺少或重复 COLLECTOR_UID'; exit 1; }
+COLLECTOR_GID=$(read_dotenv_value COLLECTOR_GID) || { echo '缺少或重复 COLLECTOR_GID'; exit 1; }
+TCP_PORT=$(read_dotenv_value TCP_PORT) || { echo '缺少或重复 TCP_PORT'; exit 1; }
+
+case "$COLLECTOR_UID" in '' | *[!0-9]*) echo 'COLLECTOR_UID 必须是正十进制整数'; exit 1;; esac
+case "$COLLECTOR_GID" in '' | *[!0-9]*) echo 'COLLECTOR_GID 必须是正十进制整数'; exit 1;; esac
 case "$TCP_PORT" in '' | *[!0-9]*) echo 'TCP_PORT 必须是十进制整数'; exit 1;; esac
+if ! [ "$COLLECTOR_UID" -gt 0 ] 2>/dev/null; then echo 'COLLECTOR_UID 不能为 root（必须大于 0）'; exit 1; fi
+if ! [ "$COLLECTOR_GID" -gt 0 ] 2>/dev/null; then echo 'COLLECTOR_GID 不能为 root（必须大于 0）'; exit 1; fi
+if ! [ "$TCP_PORT" -ge 1 ] 2>/dev/null || ! [ "$TCP_PORT" -le 65535 ] 2>/dev/null; then
+  echo 'TCP_PORT 必须在 1 到 65535 之间'
+  exit 1
+fi
 
 sudo env COLLECTOR_UID="$COLLECTOR_UID" COLLECTOR_GID="$COLLECTOR_GID" scripts/prepare-data-dir.sh
 docker compose config --quiet
@@ -62,7 +78,7 @@ docker compose up -d --build
 docker compose ps
 ```
 
-之后在该会话运行的所有 `docker compose config`、`up`、`build` 和 `ps` 命令都会使用相同的导出变量；即使打开新终端，Compose 也会自动从 `.env` 读取它们。不要跳过目录准备步骤：容器以非 root 身份写入 `/data`，错误的目录所有权会导致无法保存采集结果。
+在该会话中，准备脚本收到的 UID/GID 与 `.env` 中 Compose 使用的值一致；`$TCP_PORT` 也已通过校验，可安全用于紧随其后的端口检查。即使打开新终端，Compose 也会自动从 `.env` 读取配置；但任何需要 shell 展开 `$TCP_PORT` 的命令仍要先重新运行上述片段。不要跳过目录准备步骤：容器以非 root 身份写入 `/data`，错误的目录所有权会导致无法保存采集结果。
 
 ## 启动与连接配置
 
@@ -118,13 +134,9 @@ else
 fi
 ```
 
-自定义端口命令会使用 shell 展开的 `TCP_PORT`。Compose 会自行读取 `.env`，但 shell 不会；在服务器当前终端、并且**紧接在执行自定义端口命令前**加载和校验：
+自定义端口命令会使用 shell 展开的 `TCP_PORT`。Compose 会自行读取 `.env`，但 shell 不会；在服务器当前终端、并且**紧接在执行自定义端口命令前**完整运行“自定义 UID/GID 或端口”章节的“安全读取和校验”片段，然后执行：
 
 ```bash
-set -a
-. ./.env
-set +a
-case "$TCP_PORT" in '' | *[!0-9]*) echo 'TCP_PORT 必须是十进制整数'; exit 1;; esac
 docker compose port collector "$TCP_PORT"
 sudo ss -ltnp | grep ":$TCP_PORT"
 ```
@@ -181,15 +193,10 @@ sudo scripts/prepare-data-dir.sh
 docker compose up -d --build
 ```
 
-自定义 UID/GID 时，保留现有 `.env`，并在同一终端加载它后再恢复目录权限和启动：
+自定义 UID/GID 时，保留现有 `.env`，并在同一终端先完整运行“自定义 UID/GID 或端口”章节的“安全读取和校验”片段，再恢复目录权限和启动：
 
 ```bash
 docker compose down
-set -a
-. ./.env
-set +a
-case "$COLLECTOR_UID" in '' | *[!0-9]*) echo 'COLLECTOR_UID 必须是非负十进制整数'; exit 1;; esac
-case "$COLLECTOR_GID" in '' | *[!0-9]*) echo 'COLLECTOR_GID 必须是非负十进制整数'; exit 1;; esac
 sudo env COLLECTOR_UID="$COLLECTOR_UID" COLLECTOR_GID="$COLLECTOR_GID" scripts/prepare-data-dir.sh
 docker compose up -d --build
 ```
@@ -207,13 +214,9 @@ docker compose port collector 30050
 sudo ss -ltnp | grep ':30050'
 ```
 
-自定义端口时，在服务器当前终端、紧接在端口检查前执行：
+自定义端口时，在服务器当前终端、紧接在端口检查前完整运行“自定义 UID/GID 或端口”章节的“安全读取和校验”片段，然后执行：
 
 ```bash
-set -a
-. ./.env
-set +a
-case "$TCP_PORT" in '' | *[!0-9]*) echo 'TCP_PORT 必须是十进制整数'; exit 1;; esac
 docker compose port collector "$TCP_PORT"
 sudo ss -ltnp | grep ":$TCP_PORT"
 ```
@@ -224,7 +227,7 @@ sudo ss -ltnp | grep ":$TCP_PORT"
 
 ## 部署验证说明
 
-当前 WSL 环境无法执行 Docker 命令（Docker CLI 不可用），因此没有在此环境进行容器启动、`docker compose config` 或镜像构建验证。请在目标阿里云服务器完成目录准备后执行。若使用自定义设置，请保留上一节的 `.env`，并在同一终端先加载/校验它，再执行以下命令；不要临时省略 UID/GID 或端口：
+当前 WSL 环境无法执行 Docker 命令（Docker CLI 不可用），因此没有在此环境进行容器启动、`docker compose config` 或镜像构建验证。请在目标阿里云服务器完成目录准备后执行。若使用自定义设置，请保留上一节的 `.env`，并在同一终端先完整运行“自定义 UID/GID 或端口”章节的“安全读取和校验”片段，再执行以下命令；不要临时省略 UID/GID 或端口：
 
 ```bash
 docker compose config --quiet
@@ -238,13 +241,9 @@ docker compose ps
 docker compose port collector 30050
 ```
 
-自定义端口的服务器端发布检查，必须先在当前 shell 加载 `.env`，再展开 `$TCP_PORT`：
+自定义端口的服务器端发布检查，必须先在当前 shell 完整运行“自定义 UID/GID 或端口”章节的“安全读取和校验”片段，再展开 `$TCP_PORT`：
 
 ```bash
-set -a
-. ./.env
-set +a
-case "$TCP_PORT" in '' | *[!0-9]*) echo 'TCP_PORT 必须是十进制整数'; exit 1;; esac
 docker compose port collector "$TCP_PORT"
 ```
 
