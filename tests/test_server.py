@@ -214,6 +214,9 @@ class CollectorServerTest(unittest.TestCase):
             def wait_for_shutdown_coordinator(self):
                 allow_shutdown_to_finish.wait(timeout=2)
 
+            def server_close(self):
+                return None
+
         controlled_server = ControlledServer()
         signal_handlers = {}
 
@@ -276,6 +279,9 @@ class CollectorServerTest(unittest.TestCase):
             def wait_for_shutdown_coordinator(self):
                 return None
 
+            def server_close(self):
+                return None
+
         def install_signal(received_signal, handler):
             signal_calls.append((received_signal, handler))
             if len(signal_calls) == 1:
@@ -324,6 +330,9 @@ class CollectorServerTest(unittest.TestCase):
             def wait_for_shutdown_coordinator(self):
                 return None
 
+            def server_close(self):
+                return None
+
         def install_signal(received_signal, handler):
             signal_calls.append((received_signal, handler))
             if len(signal_calls) == 1:
@@ -357,6 +366,99 @@ class CollectorServerTest(unittest.TestCase):
             (signal.SIGINT, previous_sigint_handler), signal_calls[2]
         )
         log_exception.assert_called_once()
+
+    def test_run_server_preserves_setup_error_when_server_close_fails(self):
+        install_error = ValueError("signal setup failed")
+        close_error = OSError("pipe close failed")
+
+        class ControlledServer:
+            server_address = ("127.0.0.1", 40123)
+
+            def __init__(self):
+                self.close_calls = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_arguments):
+                self.server_close()
+                return False
+
+            def start_shutdown_coordinator(self):
+                return True
+
+            def cancel_shutdown_coordinator(self):
+                return None
+
+            def wait_for_shutdown_coordinator(self):
+                return None
+
+            def server_close(self):
+                self.close_calls += 1
+                raise close_error
+
+        server = ControlledServer()
+        with mock.patch(
+            "data_record_server.server.create_server", return_value=server
+        ), mock.patch(
+            "data_record_server.server.signal.getsignal", return_value=object()
+        ), mock.patch(
+            "data_record_server.server.signal.signal", side_effect=install_error
+        ), mock.patch("data_record_server.server.LOGGER.exception") as log_exception:
+            with self.assertRaises(ValueError) as caught:
+                from data_record_server.server import run_server
+
+                run_server(Config("127.0.0.1", 0, self._data_dir, 4))
+
+        self.assertIs(install_error, caught.exception)
+        self.assertEqual(1, server.close_calls)
+        log_exception.assert_called_once()
+
+    def test_run_server_propagates_server_close_error_without_primary_error(self):
+        close_error = OSError("pipe close failed")
+
+        class ControlledServer:
+            server_address = ("127.0.0.1", 40123)
+
+            def __init__(self):
+                self.close_calls = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_arguments):
+                self.server_close()
+                return False
+
+            def start_shutdown_coordinator(self):
+                return True
+
+            def serve_forever(self):
+                return None
+
+            def notify_shutdown(self):
+                return None
+
+            def wait_for_shutdown_coordinator(self):
+                return None
+
+            def server_close(self):
+                self.close_calls += 1
+                raise close_error
+
+        server = ControlledServer()
+        with mock.patch(
+            "data_record_server.server.create_server", return_value=server
+        ), mock.patch(
+            "data_record_server.server.signal.getsignal", return_value=object()
+        ), mock.patch("data_record_server.server.signal.signal"):
+            with self.assertRaises(OSError) as caught:
+                from data_record_server.server import run_server
+
+                run_server(Config("127.0.0.1", 0, self._data_dir, 4))
+
+        self.assertIs(close_error, caught.exception)
+        self.assertEqual(1, server.close_calls)
 
     def test_shutdown_handler_only_notifies_the_server(self):
         with mock.patch.object(self._server, "notify_shutdown") as notify_shutdown, mock.patch(
