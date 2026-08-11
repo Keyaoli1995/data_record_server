@@ -12,7 +12,7 @@ from data_record_server.storage import Storage
 
 
 class StorageTest(unittest.TestCase):
-    def test_preserves_exact_bytes_and_records_lifecycle_events(self):
+    def test_preserves_exact_bytes_without_per_read_events(self):
         timestamps = iter(
             datetime(2026, 8, 10, 12, 0, 0, tzinfo=timezone.utc)
             + timedelta(seconds=offset)
@@ -39,25 +39,20 @@ class StorageTest(unittest.TestCase):
 
         relative_path = f"connections/{connection_files[0].name}"
         self.assertEqual(
-            ["connected", "received", "received", "disconnected"],
+            ["connected", "disconnected"],
             [event["event"] for event in events],
         )
         self.assertEqual(
             [
                 "2026-08-10T12:00:00Z",
                 "2026-08-10T12:00:01Z",
-                "2026-08-10T12:00:02Z",
-                "2026-08-10T12:00:03Z",
             ],
             [event["time"] for event in events],
         )
-        self.assertEqual([relative_path] * 4, [event["file"] for event in events])
+        self.assertEqual([relative_path] * 2, [event["file"] for event in events])
         self.assertEqual("203.0.113.10", events[0]["client_ip"])
         self.assertEqual(51822, events[0]["client_port"])
-        self.assertEqual(2, events[1]["bytes"])
-        self.assertEqual("7e00", events[1]["hex"])
-        self.assertEqual("ff0d0a", events[2]["hex"])
-        self.assertEqual(5, events[3]["total_bytes"])
+        self.assertEqual(5, events[1]["total_bytes"])
 
     def test_records_connection_errors_and_closes_only_once(self):
         timestamps = iter(
@@ -149,7 +144,7 @@ class StorageTest(unittest.TestCase):
             connection_files = list((Path(directory) / "connections").glob("*.bin"))
 
             self.assertEqual([], failures)
-            self.assertEqual(connection_count * 3, len(events))
+            self.assertEqual(connection_count * 2, len(events))
             self.assertEqual(connection_count, len(connection_files))
 
             events_by_file = {}
@@ -166,12 +161,14 @@ class StorageTest(unittest.TestCase):
             )
             for file, file_events in events_by_file.items():
                 self.assertEqual(
-                    ["connected", "received", "disconnected"],
+                    ["connected", "disconnected"],
                     [event["event"] for event in file_events],
                 )
-                self.assertEqual(3, len(file_events))
-                self.assertEqual(file_events[1]["bytes"], len((Path(directory) / file).read_bytes()))
-                self.assertEqual(file_events[1]["hex"], (Path(directory) / file).read_bytes().hex())
+                self.assertEqual(2, len(file_events))
+                self.assertEqual(
+                    file_events[-1]["total_bytes"],
+                    len((Path(directory) / file).read_bytes()),
+                )
 
 
 if __name__ == "__main__":

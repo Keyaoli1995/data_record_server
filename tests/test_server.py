@@ -169,7 +169,7 @@ class CollectorServerTest(unittest.TestCase):
         finally:
             self._close_file_descriptors(captured_file_descriptors)
 
-    def test_records_complete_stream_and_receive_metadata(self):
+    def test_records_complete_stream_without_per_read_events(self):
         with socket.create_connection(self._server.server_address, timeout=2) as client:
             client.sendall(b"abcdef")
             client.shutdown(socket.SHUT_WR)
@@ -183,26 +183,18 @@ class CollectorServerTest(unittest.TestCase):
 
         events = self._read_events()
         self.assertEqual(
-            ["connected", "received", "received", "disconnected"],
+            ["connected", "disconnected"],
             [event["event"] for event in events],
         )
         self.assertEqual("127.0.0.1", events[0]["client_ip"])
         self.assertIsInstance(events[0]["client_port"], int)
-        received = [event for event in events if event["event"] == "received"]
-        self.assertEqual(b"abcdef", bytes.fromhex("".join(event["hex"] for event in received)))
-        self.assertEqual(6, sum(event["bytes"] for event in received))
+        self.assertEqual(6, events[-1]["total_bytes"])
 
     def test_closes_a_silent_connection_after_its_idle_timeout(self):
         server, server_thread = self._create_server_with_idle_timeout(0.15)
         try:
             with socket.create_connection(server.server_address, timeout=2) as client:
                 client.sendall(b"abc")
-                self._wait_for(
-                    lambda: any(
-                        event["event"] == "received" and event["hex"] == b"abc".hex()
-                        for event in self._read_events()
-                    )
-                )
                 client.settimeout(2)
                 self.assertEqual(b"", client.recv(1))
 
@@ -213,11 +205,11 @@ class CollectorServerTest(unittest.TestCase):
             )
             events = self._read_events()
             self.assertEqual(
-                ["connected", "received", "idle_timeout", "disconnected"],
+                ["connected", "idle_timeout", "disconnected"],
                 [event["event"] for event in events],
             )
-            self.assertEqual(0.15, events[2]["idle_timeout_seconds"])
-            self.assertEqual(3, events[2]["total_bytes"])
+            self.assertEqual(0.15, events[1]["idle_timeout_seconds"])
+            self.assertEqual(3, events[1]["total_bytes"])
             self.assertEqual(b"abc", (self._data_dir / events[0]["file"]).read_bytes())
             self.assertNotIn("error", [event["event"] for event in events])
         finally:
@@ -246,7 +238,7 @@ class CollectorServerTest(unittest.TestCase):
             )
             events = self._read_events()
             self.assertEqual(
-                ["connected", "received", "received", "received", "disconnected"],
+                ["connected", "disconnected"],
                 [event["event"] for event in events],
             )
             self.assertNotIn("idle_timeout", [event["event"] for event in events])
@@ -261,12 +253,7 @@ class CollectorServerTest(unittest.TestCase):
             self._server.server_address, timeout=2
         ) as first_client:
             first_client.sendall(b"first")
-            self._wait_for(
-                lambda: any(
-                    event["event"] == "received" and event["hex"] == b"firs".hex()
-                    for event in self._read_events()
-                )
-            )
+            self._wait_for(lambda: self._contains_payload(self._data_dir, b"first"))
 
             with socket.create_connection(
                 self._server.server_address, timeout=2
@@ -296,12 +283,7 @@ class CollectorServerTest(unittest.TestCase):
             payload = (self._data_dir / relative_path).read_bytes()
             self.assertEqual("connected", events[0]["event"])
             self.assertEqual("disconnected", events[-1]["event"])
-            self.assertEqual(
-                payload,
-                bytes.fromhex(
-                    "".join(event["hex"] for event in events if event["event"] == "received")
-                ),
-            )
+            self.assertEqual(2, len(events))
             self.assertEqual(len(payload), events[-1]["total_bytes"])
 
     def test_sigterm_closes_an_active_connection_before_process_exit(self):
@@ -329,12 +311,7 @@ class CollectorServerTest(unittest.TestCase):
             try:
                 client = self._connect_to_process(port, process)
                 client.sendall(b"abc")
-                self._wait_for(
-                    lambda: any(
-                        event["event"] == "received" and event["hex"] == b"abc".hex()
-                        for event in self._read_events_from(data_dir)
-                    )
-                )
+                self._wait_for(lambda: self._contains_payload(data_dir, b"abc"))
 
                 process.send_signal(signal.SIGTERM)
                 process.wait(timeout=2)
@@ -342,7 +319,7 @@ class CollectorServerTest(unittest.TestCase):
 
                 events = self._read_events_from(data_dir)
                 self.assertEqual(
-                    ["connected", "received", "disconnected"],
+                    ["connected", "disconnected"],
                     [event["event"] for event in events],
                 )
                 self.assertEqual(3, events[-1]["total_bytes"])
@@ -375,11 +352,7 @@ class CollectorServerTest(unittest.TestCase):
                     client.sendall(b"abc")
                     deadline = time.monotonic() + 2
                     while time.monotonic() < deadline:
-                        if any(
-                            event["event"] == "received"
-                            and event["hex"] == b"abc".hex()
-                            for event in self._read_events()
-                        ):
+                        if self._contains_payload(self._data_dir, b"abc"):
                             failure_requested.set()
                             client_recorded.set()
                             break
@@ -1047,6 +1020,13 @@ with tempfile.TemporaryDirectory() as directory:
             json.loads(line)
             for line in events_path.read_text(encoding="utf-8").splitlines()
         ]
+
+    @staticmethod
+    def _contains_payload(data_dir, expected_payload):
+        return any(
+            path.read_bytes() == expected_payload
+            for path in (data_dir / "connections").glob("*.bin")
+        )
 
     def _wait_for(self, predicate):
         deadline = time.monotonic() + 2
