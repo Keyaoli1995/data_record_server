@@ -58,7 +58,7 @@ def test_rejects_invalid_idle_timeout_values(self):
 Run:
 
 ```bash
-python -m unittest \
+python3 -m unittest \
   tests.test_config.ConfigTest.test_uses_a_30_second_idle_timeout_by_default \
   tests.test_config.ConfigTest.test_uses_idle_timeout_environment_override \
   tests.test_config.ConfigTest.test_rejects_invalid_idle_timeout_values -v
@@ -106,7 +106,7 @@ Pass `idle_timeout_seconds=idle_timeout_seconds` when returning `Config`.
 Run:
 
 ```bash
-python -m unittest tests.test_config -v
+python3 -m unittest tests.test_config -v
 ```
 
 Expected: all `ConfigTest` tests pass.
@@ -165,7 +165,7 @@ Add a second test with a `0.15` second timeout that sends `b"a"`, sleeps `0.05` 
 Run:
 
 ```bash
-python -m unittest \
+python3 -m unittest \
   tests.test_server.CollectorServerTest.test_closes_a_silent_connection_after_its_idle_timeout \
   tests.test_server.CollectorServerTest.test_received_data_resets_the_idle_timeout -v
 ```
@@ -237,7 +237,7 @@ Keep the existing generic exception handler and `finally: recorder.close()` unch
 Run:
 
 ```bash
-python -m unittest tests.test_server.CollectorServerTest -v
+python3 -m unittest tests.test_server.CollectorServerTest -v
 ```
 
 Expected: all `CollectorServerTest` tests pass, including the two new real-socket tests.
@@ -278,7 +278,7 @@ In `test_compose_file_declares_the_collector_runtime_contract`, add this expecte
 Run:
 
 ```bash
-python -m unittest \
+python3 -m unittest \
   tests.test_deployment.DeploymentFilesTest.test_dockerfile_declares_the_collector_runtime_contract \
   tests.test_deployment.DeploymentFilesTest.test_compose_file_declares_the_collector_runtime_contract -v
 ```
@@ -321,7 +321,7 @@ In `README.md` and `DEPLOYMENT_GUIDE.md`:
 Run:
 
 ```bash
-python -m unittest tests.test_deployment -v
+python3 -m unittest tests.test_deployment -v
 ```
 
 Expected: all deployment contract tests pass.
@@ -331,8 +331,8 @@ Expected: all deployment contract tests pass.
 Run:
 
 ```bash
-python -m unittest discover -s tests -v
-python -m compileall -q data_record_server tests
+python3 -m unittest discover -s tests -v
+python3 -m compileall -q data_record_server tests
 git diff --check
 ```
 
