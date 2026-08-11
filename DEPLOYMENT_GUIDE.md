@@ -268,7 +268,6 @@ tail -n 50 data/events.jsonl
 应该看到：
 
 - `connected`：客户端建立了连接。
-- `received`：接收到了一批数据。
 - `idle_timeout`：连续 30 秒未收到数据，服务正在主动关闭这条连接。
 - `disconnected`：客户端断开了连接。
 

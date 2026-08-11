@@ -85,15 +85,6 @@ class ConnectionRecorder:
         self._stream.write(data)
         self._stream.flush()
         self._total_bytes += len(data)
-        self._write_event(
-            {
-                "event": "received",
-                "time": format_time(self._clock()),
-                "file": self.relative_path,
-                "bytes": len(data),
-                "hex": data.hex(),
-            }
-        )
 
     def record_idle_timeout(self, idle_timeout_seconds: float) -> None:
         self._write_event(

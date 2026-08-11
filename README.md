@@ -3,7 +3,7 @@
 本服务用于接收未知协议的 TCP 数据，并按每个连接**原样保存**收到的字节流。它不解析协议、不添加分隔符或编码转换，也不会发送应用层 ACK。
 
 - `data/connections/*.bin` 是原始数据的权威副本，后续协议分析应以它为准。
-- `data/events.jsonl` 是诊断日志，记录连接生命周期和每次 `recv()` 读取的摘要；其中的十六进制数据便于排查，但不替代 `.bin`。
+- `data/events.jsonl` 是诊断日志，只记录连接、超时、断开和错误等生命周期事件；不保存每次 `recv()` 的数据摘要。
 - TCP 内核本身仍会处理正常的传输层确认；这里“不发送 ACK”是指服务不会猜测未知协议并回复应用层报文。
 
 ## 前置条件
@@ -177,12 +177,11 @@ nc -vz 8.134.210.73 30100
 | `event` 值 | 字段 | 含义 |
 | --- | --- | --- |
 | `connected` | `time`、`file`、`client_ip`、`client_port` | 已建立连接及对应的原始文件。 |
-| `received` | `time`、`file`、`bytes`、`hex` | 一次 TCP `recv()` 的读取长度和十六进制内容。 |
 | `idle_timeout` | `time`、`file`、`idle_timeout_seconds`、`total_bytes` | 该连接在设定秒数内未收到数据，服务主动结束前的超时记录。 |
 | `disconnected` | `time`、`file`、`total_bytes` | 连接结束及该文件累计字节数。 |
 | `error` | `time`、`file`、`error_type`、`error` | 该连接处理期间的异常摘要。 |
 
-一次 TCP 连接对应一个 `.bin` 文件，文件内容按接收顺序连续追加。`received` 事件对应的是 TCP `recv()` 的读取块，**不是**协议帧：同一协议帧可能被拆成多块，多个协议帧也可能合并到一块。请根据 `.bin` 的完整字节序列进行协议分析。正常客户端/App 主动关闭、服务端关闭或连接错误结束时会写入 `disconnected`；因空闲超时关闭时，事件顺序为 `idle_timeout` 后紧跟 `disconnected`。长时间保持连接且持续收到数据时，文件和 `received` 事件会继续增长而暂时没有这些终止事件。
+一次 TCP 连接对应一个 `.bin` 文件，文件内容按接收顺序连续追加。TCP 没有协议帧边界：同一协议帧可能被拆成多次读取，多个协议帧也可能合并到一次读取；请根据 `.bin` 的完整字节序列进行协议分析。正常客户端/App 主动关闭、服务端关闭或连接错误结束时会写入 `disconnected`；因空闲超时关闭时，事件顺序为 `idle_timeout` 后紧跟 `disconnected`。长时间保持连接且持续收到数据时，`.bin` 会继续增长，直到连接结束或超时。
 
 ## 重启、停止与备份
 
@@ -272,4 +271,4 @@ docker compose port collector 30050
 docker compose port collector "$TCP_PORT"
 ```
 
-再从外部网络以实际端口探测并从 App 发起真实 TCP 连接：默认端口使用 `nc -vz 8.134.210.73 30050`；如果 `.env` 中为 `TCP_PORT=30100`，则使用 `nc -vz 8.134.210.73 30100`。外部客户端不能读取服务器 `.env`，请将示例端口替换为当前实际值。确认 `data/connections/` 出现对应 `.bin` 文件；在 App 关闭该连接后，`data/events.jsonl` 应出现同名文件的 `connected`、`received` 和 `disconnected` 事件。
+再从外部网络以实际端口探测并从 App 发起真实 TCP 连接：默认端口使用 `nc -vz 8.134.210.73 30050`；如果 `.env` 中为 `TCP_PORT=30100`，则使用 `nc -vz 8.134.210.73 30100`。外部客户端不能读取服务器 `.env`，请将示例端口替换为当前实际值。确认 `data/connections/` 出现对应 `.bin` 文件；在 App 关闭该连接后，`data/events.jsonl` 应出现同名文件的 `connected` 和 `disconnected` 事件。
