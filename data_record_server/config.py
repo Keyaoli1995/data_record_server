@@ -10,6 +10,7 @@ class Config:
     port: int
     data_dir: Path
     read_buffer_bytes: int
+    idle_timeout_seconds: int = 30
 
     @classmethod
     def from_environ(
@@ -20,17 +21,23 @@ class Config:
         read_buffer_bytes = _parse_integer(
             environment.get("READ_BUFFER_BYTES", "4096"), "READ_BUFFER_BYTES"
         )
+        idle_timeout_seconds = _parse_integer(
+            environment.get("IDLE_TIMEOUT_SECONDS", "30"), "IDLE_TIMEOUT_SECONDS"
+        )
 
         if not 1 <= port <= 65535:
             raise ValueError("TCP_PORT must be between 1 and 65535")
         if read_buffer_bytes <= 0:
             raise ValueError("READ_BUFFER_BYTES must be positive")
+        if idle_timeout_seconds <= 0:
+            raise ValueError("IDLE_TIMEOUT_SECONDS must be positive")
 
         return cls(
             host=environment.get("TCP_HOST", "0.0.0.0"),
             port=port,
             data_dir=Path(environment.get("DATA_DIR", "/data")),
             read_buffer_bytes=read_buffer_bytes,
+            idle_timeout_seconds=idle_timeout_seconds,
         )
 
 
