@@ -32,16 +32,17 @@ sudo scripts/prepare-data-dir.sh
 
 脚本固定操作本项目根目录下的 `data/`，而不是调用命令时所在目录。默认容器身份为 UID/GID `10001:10001`；脚本会创建目录、限制其权限，并在有权限时修正既有文件的所有者。它拒绝将 `data/` 作为符号链接，且不会递归跟随符号链接，因此不会因错误的工作目录或链接而修改项目外路径。
 
-## 自定义 UID/GID 或端口
+## 自定义 UID/GID、端口或空闲超时
 
-默认部署不需要 `.env`：使用上一节的 `sudo scripts/prepare-data-dir.sh`，再运行 `docker compose up -d --build` 即可，默认值为 `10001:10001` 和 TCP `30050`。
+默认部署不需要 `.env`：使用上一节的 `sudo scripts/prepare-data-dir.sh`，再运行 `docker compose up -d --build` 即可，默认值为 `10001:10001`、TCP `30050` 和 30 秒空闲超时。
 
-若要自定义 UID/GID 或端口，请在项目根目录创建仅供本机/服务器使用的 `.env`（不要提交该文件）。即使只修改其中一个值，`.env` 也必须完整定义 `COLLECTOR_UID`、`COLLECTOR_GID` 和 `TCP_PORT` 三项。以下是使用本机 `1000:1000` 和 TCP `30100` 的完整示例：
+若要自定义 UID/GID、端口或空闲超时，请在项目根目录创建仅供本机/服务器使用的 `.env`（不要提交该文件）。即使只修改其中一个值，`.env` 也必须完整定义 `COLLECTOR_UID`、`COLLECTOR_GID`、`TCP_PORT` 和 `IDLE_TIMEOUT_SECONDS` 四项。以下是使用本机 `1000:1000`、TCP `30100` 和 45 秒空闲超时的完整示例：
 
 ```dotenv
 COLLECTOR_UID=1000
 COLLECTOR_GID=1000
 TCP_PORT=30100
+IDLE_TIMEOUT_SECONDS=45
 ```
 
 Compose 会自动读取项目根目录的 `.env`，让构建参数、容器 `user`、端口映射和容器内 `TCP_PORT` 使用同一组值。但 `sudo` 不会自动读取它。
@@ -65,14 +66,20 @@ read_dotenv_value() {
 COLLECTOR_UID=$(read_dotenv_value COLLECTOR_UID) || { echo '缺少或重复 COLLECTOR_UID'; exit 1; }
 COLLECTOR_GID=$(read_dotenv_value COLLECTOR_GID) || { echo '缺少或重复 COLLECTOR_GID'; exit 1; }
 TCP_PORT=$(read_dotenv_value TCP_PORT) || { echo '缺少或重复 TCP_PORT'; exit 1; }
+IDLE_TIMEOUT_SECONDS=$(read_dotenv_value IDLE_TIMEOUT_SECONDS) || { echo '缺少或重复 IDLE_TIMEOUT_SECONDS'; exit 1; }
 
 case "$COLLECTOR_UID" in '' | *[!0-9]*) echo 'COLLECTOR_UID 必须是正十进制整数'; exit 1;; esac
 case "$COLLECTOR_GID" in '' | *[!0-9]*) echo 'COLLECTOR_GID 必须是正十进制整数'; exit 1;; esac
 case "$TCP_PORT" in '' | *[!0-9]*) echo 'TCP_PORT 必须是十进制整数'; exit 1;; esac
+case "$IDLE_TIMEOUT_SECONDS" in '' | *[!0-9]*) echo 'IDLE_TIMEOUT_SECONDS 必须是正十进制整数'; exit 1;; esac
 if ! [ "$COLLECTOR_UID" -gt 0 ] 2>/dev/null; then echo 'COLLECTOR_UID 不能为 root（必须大于 0）'; exit 1; fi
 if ! [ "$COLLECTOR_GID" -gt 0 ] 2>/dev/null; then echo 'COLLECTOR_GID 不能为 root（必须大于 0）'; exit 1; fi
 if ! [ "$TCP_PORT" -ge 1 ] 2>/dev/null || ! [ "$TCP_PORT" -le 65535 ] 2>/dev/null; then
   echo 'TCP_PORT 必须在 1 到 65535 之间'
+  exit 1
+fi
+if ! [ "$IDLE_TIMEOUT_SECONDS" -gt 0 ] 2>/dev/null; then
+  echo 'IDLE_TIMEOUT_SECONDS 必须大于 0'
   exit 1
 fi
 ```
@@ -88,7 +95,7 @@ docker compose up -d --build
 docker compose ps
 ```
 
-在该会话中，准备脚本收到的 UID/GID 与 `.env` 中 Compose 使用的值一致；`$TCP_PORT` 也已通过校验，可安全用于紧随其后的端口检查。即使打开新终端，Compose 也会自动从 `.env` 读取配置；但任何需要 shell 展开 `$TCP_PORT` 的命令仍要先重新运行**仅加载并校验 `.env`（无副作用）**片段。不要跳过目录准备步骤：容器以非 root 身份写入 `/data`，错误的目录所有权会导致无法保存采集结果。
+在该会话中，准备脚本收到的 UID/GID 与 `.env` 中 Compose 使用的值一致；`$TCP_PORT` 和 `$IDLE_TIMEOUT_SECONDS` 也已通过校验。即使打开新终端，Compose 也会自动从 `.env` 读取配置；但任何需要 shell 展开这些变量的命令仍要先重新运行**仅加载并校验 `.env`（无副作用）**片段。不要跳过目录准备步骤：容器以非 root 身份写入 `/data`，错误的目录所有权会导致无法保存采集结果。
 
 ## 启动与连接配置
 
@@ -101,6 +108,8 @@ docker compose logs --tail=100 collector
 ```
 
 服务在容器中监听 `0.0.0.0:30050`，默认将主机 TCP `30050` 发布到容器。App 的服务器地址设置为 `8.134.210.73`，TCP 端口设置为 `30050`。
+
+每条 TCP 连接连续 30 秒未收到任何数据时，服务会主动关闭该连接；每次收到数据都会重新开始计时。对于当前约 1 秒一次的设备回传频率，30 秒允许短暂网络波动，同时会结束设备突然断电留下的旧连接。若设备存在更长的正常静默期，请在 `.env` 中将 `IDLE_TIMEOUT_SECONDS` 设置为大于该静默期的正整数，然后重启服务。
 
 使用非默认端口时，请按上一节创建 `.env`，而不要只在单条命令前临时设置 `TCP_PORT`。例如 `.env` 中的 `TCP_PORT=30100` 会使服务监听并发布 `30100/TCP`。阿里云安全组和 App 端口也必须一同改为 `30100`，否则无法从公网连接。
 
@@ -169,10 +178,11 @@ nc -vz 8.134.210.73 30100
 | --- | --- | --- |
 | `connected` | `time`、`file`、`client_ip`、`client_port` | 已建立连接及对应的原始文件。 |
 | `received` | `time`、`file`、`bytes`、`hex` | 一次 TCP `recv()` 的读取长度和十六进制内容。 |
+| `idle_timeout` | `time`、`file`、`idle_timeout_seconds`、`total_bytes` | 该连接在设定秒数内未收到数据，服务主动结束前的超时记录。 |
 | `disconnected` | `time`、`file`、`total_bytes` | 连接结束及该文件累计字节数。 |
 | `error` | `time`、`file`、`error_type`、`error` | 该连接处理期间的异常摘要。 |
 
-一次 TCP 连接对应一个 `.bin` 文件，文件内容按接收顺序连续追加。`received` 事件对应的是 TCP `recv()` 的读取块，**不是**协议帧：同一协议帧可能被拆成多块，多个协议帧也可能合并到一块。请根据 `.bin` 的完整字节序列进行协议分析。`disconnected` 只有在客户端/App 主动关闭长连接、服务端关闭连接，或连接发生错误而结束后才会写入；长时间保持连接时，文件和 `received` 事件会继续增长而暂时没有该事件。
+一次 TCP 连接对应一个 `.bin` 文件，文件内容按接收顺序连续追加。`received` 事件对应的是 TCP `recv()` 的读取块，**不是**协议帧：同一协议帧可能被拆成多块，多个协议帧也可能合并到一块。请根据 `.bin` 的完整字节序列进行协议分析。正常客户端/App 主动关闭、服务端关闭或连接错误结束时会写入 `disconnected`；因空闲超时关闭时，事件顺序为 `idle_timeout` 后紧跟 `disconnected`。长时间保持连接且持续收到数据时，文件和 `received` 事件会继续增长而暂时没有这些终止事件。
 
 ## 重启、停止与备份
 
@@ -242,7 +252,7 @@ sudo ss -ltnp | grep ":$TCP_PORT"
 
 ## 部署验证说明
 
-当前 WSL 环境无法执行 Docker 命令（Docker CLI 不可用），因此没有在此环境进行容器启动、`docker compose config` 或镜像构建验证。请在目标阿里云服务器完成目录准备后执行。若使用自定义设置，请保留上一节的 `.env`，并在同一终端先只运行“仅加载并校验 `.env`（无副作用）”片段，再执行以下命令；不要临时省略 UID/GID 或端口：
+当前 WSL 环境无法执行 Docker 命令（Docker CLI 不可用），因此没有在此环境进行容器启动、`docker compose config` 或镜像构建验证。请在目标阿里云服务器完成目录准备后执行。若使用自定义设置，请保留上一节的 `.env`，并在同一终端先只运行“仅加载并校验 `.env`（无副作用）”片段，再执行以下命令；不要临时省略 UID/GID、端口或空闲超时：
 
 ```bash
 docker compose config --quiet

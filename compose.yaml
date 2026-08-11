@@ -10,6 +10,7 @@ services:
       TCP_PORT: ${TCP_PORT:-30050}
       DATA_DIR: /data
       READ_BUFFER_BYTES: ${READ_BUFFER_BYTES:-4096}
+      IDLE_TIMEOUT_SECONDS: ${IDLE_TIMEOUT_SECONDS:-30}
     ports:
       - "${TCP_PORT:-30050}:${TCP_PORT:-30050}/tcp"
     volumes:
