@@ -55,6 +55,7 @@ class DeploymentFilesTest(unittest.TestCase):
             "TCP_PORT": "30050",
             "DATA_DIR": "/data",
             "READ_BUFFER_BYTES": "4096",
+            "IDLE_TIMEOUT_SECONDS": "30",
         }.items():
             self.assertIn(f"{name}={value}", environment)
         self.assertIn(f"ARG COLLECTOR_UID={DEFAULT_UID}", instructions)
@@ -98,6 +99,7 @@ class DeploymentFilesTest(unittest.TestCase):
                 "TCP_PORT": "${TCP_PORT:-30050}",
                 "DATA_DIR": "/data",
                 "READ_BUFFER_BYTES": "${READ_BUFFER_BYTES:-4096}",
+                "IDLE_TIMEOUT_SECONDS": "${IDLE_TIMEOUT_SECONDS:-30}",
             },
             collector["environment"],
         )
