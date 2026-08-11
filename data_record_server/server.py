@@ -27,11 +27,21 @@ class CollectorRequestHandler(socketserver.BaseRequestHandler):
         recorder = None
         try:
             recorder = self.server.storage.open_connection(self.client_address)
+            self.request.settimeout(self.server.idle_timeout_seconds)
             while True:
                 data = self.request.recv(self.server.read_buffer_bytes)
                 if not data:
                     break
                 recorder.record_received(data)
+        except socket.timeout:
+            if recorder is not None:
+                try:
+                    recorder.record_idle_timeout(self.server.idle_timeout_seconds)
+                except Exception:
+                    LOGGER.exception(
+                        "Failed to record idle timeout for client connection from %s",
+                        self.client_address,
+                    )
         except Exception as error:
             if recorder is not None:
                 try:
@@ -66,9 +76,11 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         server_address: ServerAddress,
         storage: Storage,
         read_buffer_bytes: int,
+        idle_timeout_seconds: float = 30,
     ) -> None:
         self.storage = storage
         self.read_buffer_bytes = read_buffer_bytes
+        self.idle_timeout_seconds = idle_timeout_seconds
         self._active_requests = set()
         self._active_requests_condition = threading.Condition()
         self._shutdown_coordinator = None
@@ -276,7 +288,10 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 def create_server(config: Config) -> CollectorServer:
     """Create a collector bound to the configured address."""
     return CollectorServer(
-        (config.host, config.port), Storage(config.data_dir), config.read_buffer_bytes
+        (config.host, config.port),
+        Storage(config.data_dir),
+        config.read_buffer_bytes,
+        config.idle_timeout_seconds,
     )
 
 

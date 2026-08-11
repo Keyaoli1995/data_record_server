@@ -95,6 +95,17 @@ class ConnectionRecorder:
             }
         )
 
+    def record_idle_timeout(self, idle_timeout_seconds: float) -> None:
+        self._write_event(
+            {
+                "event": "idle_timeout",
+                "time": format_time(self._clock()),
+                "file": self.relative_path,
+                "idle_timeout_seconds": idle_timeout_seconds,
+                "total_bytes": self._total_bytes,
+            }
+        )
+
     def record_error(self, error: BaseException) -> None:
         self._write_event(
             {
