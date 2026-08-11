@@ -192,6 +192,70 @@ class CollectorServerTest(unittest.TestCase):
         self.assertEqual(b"abcdef", bytes.fromhex("".join(event["hex"] for event in received)))
         self.assertEqual(6, sum(event["bytes"] for event in received))
 
+    def test_closes_a_silent_connection_after_its_idle_timeout(self):
+        server, server_thread = self._create_server_with_idle_timeout(0.15)
+        try:
+            with socket.create_connection(server.server_address, timeout=2) as client:
+                client.sendall(b"abc")
+                self._wait_for(
+                    lambda: any(
+                        event["event"] == "received" and event["hex"] == b"abc".hex()
+                        for event in self._read_events()
+                    )
+                )
+                client.settimeout(2)
+                self.assertEqual(b"", client.recv(1))
+
+            self._wait_for(
+                lambda: any(
+                    event["event"] == "disconnected" for event in self._read_events()
+                )
+            )
+            events = self._read_events()
+            self.assertEqual(
+                ["connected", "received", "idle_timeout", "disconnected"],
+                [event["event"] for event in events],
+            )
+            self.assertEqual(0.15, events[2]["idle_timeout_seconds"])
+            self.assertEqual(3, events[2]["total_bytes"])
+            self.assertEqual(b"abc", (self._data_dir / events[0]["file"]).read_bytes())
+            self.assertNotIn("error", [event["event"] for event in events])
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+            self.assertFalse(server_thread.is_alive())
+
+    def test_received_data_resets_the_idle_timeout(self):
+        server, server_thread = self._create_server_with_idle_timeout(0.15)
+        try:
+            with socket.create_connection(server.server_address, timeout=2) as client:
+                client.sendall(b"a")
+                time.sleep(0.05)
+                client.sendall(b"b")
+                time.sleep(0.05)
+                client.sendall(b"c")
+                client.shutdown(socket.SHUT_WR)
+                client.settimeout(2)
+                self.assertEqual(b"", client.recv(1))
+
+            self._wait_for(
+                lambda: any(
+                    event["event"] == "disconnected" for event in self._read_events()
+                )
+            )
+            events = self._read_events()
+            self.assertEqual(
+                ["connected", "received", "received", "received", "disconnected"],
+                [event["event"] for event in events],
+            )
+            self.assertNotIn("idle_timeout", [event["event"] for event in events])
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+            self.assertFalse(server_thread.is_alive())
+
     def test_accepts_a_second_client_while_the_first_remains_connected(self):
         with socket.create_connection(
             self._server.server_address, timeout=2
@@ -900,6 +964,17 @@ with tempfile.TemporaryDirectory() as directory:
 
     def _read_events(self):
         return self._read_events_from(self._data_dir)
+
+    def _create_server_with_idle_timeout(self, idle_timeout_seconds):
+        server = CollectorServer(
+            server_address=("127.0.0.1", 0),
+            storage=Storage(self._data_dir),
+            read_buffer_bytes=4,
+            idle_timeout_seconds=idle_timeout_seconds,
+        )
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        return server, thread
 
     def _assert_file_descriptors_closed(self, file_descriptors):
         for file_descriptor in file_descriptors:
