@@ -16,6 +16,23 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(Path("/data"), config.data_dir)
         self.assertEqual(4096, config.read_buffer_bytes)
 
+    def test_uses_a_30_second_idle_timeout_by_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            config = Config.from_environ()
+
+        self.assertEqual(30, config.idle_timeout_seconds)
+
+    def test_uses_idle_timeout_environment_override(self):
+        config = Config.from_environ({"IDLE_TIMEOUT_SECONDS": "45"})
+
+        self.assertEqual(45, config.idle_timeout_seconds)
+
+    def test_rejects_invalid_idle_timeout_values(self):
+        for value in ("0", "-1", "not-a-number"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "IDLE_TIMEOUT_SECONDS"):
+                    Config.from_environ({"IDLE_TIMEOUT_SECONDS": value})
+
     def test_uses_environment_overrides(self):
         environment = {
             "TCP_HOST": "127.0.0.1",
