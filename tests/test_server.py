@@ -221,6 +221,21 @@ class CollectorServerTest(unittest.TestCase):
             },
         )
 
+    def test_records_a_device_id_with_a_slash(self):
+        record = b'{"deviceId":"a/b","sequence":1}\n'
+        with socket.create_connection(self._server.server_address, timeout=2) as client:
+            client.sendall(record)
+            client.shutdown(socket.SHUT_WR)
+            self.assertEqual(b"", client.recv(1))
+
+        self._wait_for(lambda: self._contains_payload(self._data_dir, record))
+
+        device_files = self._device_files()
+        self.assertEqual(1, len(device_files))
+        self.assertEqual("device-a%2Fb", device_files[0].parent.name)
+        self.assertIn("_a%2Fb_", device_files[0].name)
+        self.assertEqual({"a/b"}, {event["device_id"] for event in self._session_events()})
+
     def test_rejects_invalid_json_and_missing_device_id_without_creating_data_files(self):
         with socket.create_connection(self._server.server_address, timeout=2) as client:
             client.sendall(b'not json\n{"sequence":2}\n')

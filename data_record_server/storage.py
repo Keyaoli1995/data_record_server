@@ -230,7 +230,7 @@ class Storage:
 
     def _create_session(self, device_id: str) -> DeviceSession:
         escaped_device_id = quote_from_bytes(
-            device_id.encode("utf-8", "surrogatepass")
+            device_id.encode("utf-8", "surrogatepass"), safe=""
         )
         directory = self._data_dir / "devices" / ("device-" + escaped_device_id)
         timestamp = format_time(self._clock())

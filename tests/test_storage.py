@@ -313,6 +313,30 @@ class StorageTest(unittest.TestCase):
         self.assertEqual(device_id, events[0]["device_id"])
         self.assertEqual(device_id, events[-1]["device_id"])
 
+    def test_escapes_slashes_in_a_device_id_for_one_path_component(self):
+        device_id = "a/b"
+        raw_line = b'{"deviceId":"a/b"}\n'
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(directory)
+            session = storage.append_record(
+                ("203.0.113.16", 5016), device_id, raw_line
+            )
+            relative_path = Path(session.relative_path)
+            device_directory = Path(directory) / "devices" / "device-a%2Fb"
+
+            self.assertEqual(
+                ("devices", "device-a%2Fb", relative_path.name),
+                relative_path.parts,
+            )
+            self.assertIn("_a%2Fb_", relative_path.name)
+            self.assertEqual(raw_line, (Path(directory) / relative_path).read_bytes())
+            self.assertEqual([Path(directory) / relative_path], list(device_directory.iterdir()))
+            storage.close_all_sessions()
+            events = self._read_events(directory)
+
+        self.assertEqual({device_id}, {event["device_id"] for event in events})
+
     def test_expire_removes_a_session_when_its_stream_close_fails(self):
         clock = MutableUtcClock(datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc))
 
