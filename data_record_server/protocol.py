@@ -16,9 +16,10 @@ class AcceptedRecord:
 class RecordRejected(ValueError):
     """A JSONL record was rejected for a stable protocol reason."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, raw_bytes: bytes) -> None:
         super().__init__(reason)
         self.reason = reason
+        self.raw_bytes = raw_bytes
 
 
 @dataclass(frozen=True)
@@ -58,8 +59,9 @@ class JsonlStreamParser:
             newline_index = self._buffer.find(b"\n")
             if newline_index < 0:
                 if len(self._buffer) > self._max_line_bytes:
+                    raw_bytes = bytes(self._buffer)
                     self._buffer.clear()
-                    rejections.append(RecordRejected("line_too_long"))
+                    rejections.append(RecordRejected("line_too_long", raw_bytes))
                     return FeedResult(tuple(records), tuple(rejections), True)
                 return FeedResult(tuple(records), tuple(rejections))
 
@@ -67,7 +69,7 @@ class JsonlStreamParser:
             del self._buffer[: newline_index + 1]
             if len(raw_line) - 1 > self._max_line_bytes:
                 self._buffer.clear()
-                rejections.append(RecordRejected("line_too_long"))
+                rejections.append(RecordRejected("line_too_long", raw_line))
                 return FeedResult(tuple(records), tuple(rejections), True)
 
             parsed_line = self._parse_line(raw_line)
@@ -79,32 +81,34 @@ class JsonlStreamParser:
     def finish(self) -> FeedResult:
         """Report whether the stream ended on a record boundary."""
         if self._buffer:
-            return FeedResult((), (RecordRejected("incomplete_line"),))
+            raw_bytes = bytes(self._buffer)
+            self._buffer.clear()
+            return FeedResult((), (RecordRejected("incomplete_line", raw_bytes),))
         return FeedResult.empty()
 
     def _parse_line(self, raw_line: bytes) -> Union[AcceptedRecord, RecordRejected]:
         try:
             decoded_line = raw_line.decode("utf-8")
         except UnicodeDecodeError:
-            return RecordRejected("invalid_utf8")
+            return RecordRejected("invalid_utf8", raw_line)
 
         try:
             value = json.loads(
                 decoded_line, parse_constant=_reject_non_standard_json_constant
             )
         except (json.JSONDecodeError, ValueError):
-            return RecordRejected("invalid_json")
+            return RecordRejected("invalid_json", raw_line)
 
         if not isinstance(value, dict):
-            return RecordRejected("json_not_object")
+            return RecordRejected("json_not_object", raw_line)
 
         device_id = value.get("deviceId")
         if type(device_id) is not str or not device_id:
-            return RecordRejected("missing_device_id")
+            return RecordRejected("missing_device_id", raw_line)
 
         if self._device_id is None:
             self._device_id = device_id
         elif device_id != self._device_id:
-            return RecordRejected("device_id_changed")
+            return RecordRejected("device_id_changed", raw_line)
 
         return AcceptedRecord(device_id=device_id, raw_line=raw_line)

@@ -134,9 +134,22 @@ class JsonlStreamParserTest(unittest.TestCase):
         self.assert_result(
             result,
             reasons=("line_too_long",),
+            rejected_raw_bytes=(b"x" * 65,),
             close_connection=True,
         )
         self.assert_empty_result(parser.feed(b""))
+
+    def test_preserves_raw_bytes_for_complete_and_unterminated_rejections(self):
+        parser = JsonlStreamParser(8)
+
+        result = parser.feed(b"bad\n" + b"x" * 9)
+
+        self.assert_result(
+            result,
+            reasons=("invalid_json", "line_too_long"),
+            rejected_raw_bytes=(b"bad\n", b"x" * 9),
+            close_connection=True,
+        )
 
     def test_preserves_prior_results_before_unterminated_line_exceeds_limit(self):
         parser = JsonlStreamParser(64)
@@ -168,11 +181,17 @@ class JsonlStreamParserTest(unittest.TestCase):
 
     def test_rejects_incomplete_line_at_end_of_stream(self):
         parser = JsonlStreamParser(64)
-        self.assert_empty_result(parser.feed(b'{"deviceId":"D1"}'))
+        incomplete_line = b'{"deviceId":"D1"'
+        self.assert_empty_result(parser.feed(incomplete_line))
 
         result = parser.finish()
 
-        self.assert_result(result, reasons=("incomplete_line",))
+        self.assert_result(
+            result,
+            reasons=("incomplete_line",),
+            rejected_raw_bytes=(incomplete_line,),
+        )
+        self.assert_empty_result(parser.finish())
 
     def assert_rejection_is_recoverable(self, data, reason):
         parser = JsonlStreamParser(64)
@@ -196,10 +215,16 @@ class JsonlStreamParserTest(unittest.TestCase):
         raw_lines=(),
         device_ids=(),
         reasons=(),
+        rejected_raw_bytes=None,
         close_connection=False,
     ):
         self.assertIsInstance(result, FeedResult)
         self.assertEqual(raw_lines, tuple(record.raw_line for record in result.records))
         self.assertEqual(device_ids, tuple(record.device_id for record in result.records))
         self.assertEqual(reasons, tuple(error.reason for error in result.rejections))
+        if rejected_raw_bytes is not None:
+            self.assertEqual(
+                rejected_raw_bytes,
+                tuple(error.raw_bytes for error in result.rejections),
+            )
         self.assertEqual(close_connection, result.close_connection)
