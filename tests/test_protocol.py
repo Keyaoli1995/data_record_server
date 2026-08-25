@@ -1,20 +1,72 @@
 import unittest
 
-from data_record_server.protocol import JsonlStreamParser, RecordRejected
+from data_record_server.protocol import FeedResult, JsonlStreamParser
 
 
 class JsonlStreamParserTest(unittest.TestCase):
     def test_keeps_original_crlf_and_device_id_across_chunks(self):
         parser = JsonlStreamParser(64)
 
-        self.assertEqual([], parser.feed(b'{"deviceId":"D1"}\r'))
-        records = parser.feed(b'\n{"deviceId":"D1","n":2}\n')
+        self.assert_empty_result(parser.feed(b'{"deviceId":"D1"}\r'))
+        result = parser.feed(b'\n{"deviceId":"D1","n":2}\n')
 
-        self.assertEqual(
-            [b'{"deviceId":"D1"}\r\n', b'{"deviceId":"D1","n":2}\n'],
-            [record.raw_line for record in records],
+        self.assert_result(
+            result,
+            raw_lines=(b'{"deviceId":"D1"}\r\n', b'{"deviceId":"D1","n":2}\n'),
+            device_ids=("D1", "D1"),
         )
-        self.assertEqual(["D1", "D1"], [record.device_id for record in records])
+
+    def test_drains_valid_invalid_valid_records_from_one_feed(self):
+        parser = JsonlStreamParser(64)
+        valid_line = b'{"deviceId":"D1"}\n'
+
+        result = parser.feed(valid_line + b'{"deviceId":\n' + valid_line)
+
+        self.assert_result(
+            result,
+            raw_lines=(valid_line, valid_line),
+            device_ids=("D1", "D1"),
+            reasons=("invalid_json",),
+        )
+        self.assert_empty_result(parser.finish())
+
+    def test_drains_invalid_then_valid_record_from_one_feed(self):
+        parser = JsonlStreamParser(64)
+        valid_line = b'{"deviceId":"D1"}\n'
+
+        result = parser.feed(b'{"deviceId":\n' + valid_line)
+
+        self.assert_result(
+            result,
+            raw_lines=(valid_line,),
+            device_ids=("D1",),
+            reasons=("invalid_json",),
+        )
+        self.assert_empty_result(parser.finish())
+
+    def test_preserves_multiple_rejections_in_input_order(self):
+        parser = JsonlStreamParser(64)
+        valid_line = b'{"deviceId":"D1"}\n'
+
+        result = parser.feed(
+            b'\xff\n'
+            b'{"deviceId":\n'
+            b'["D1"]\n'
+            b'{"deviceId":""}\n'
+            + valid_line
+        )
+
+        self.assert_result(
+            result,
+            raw_lines=(valid_line,),
+            device_ids=("D1",),
+            reasons=(
+                "invalid_utf8",
+                "invalid_json",
+                "json_not_object",
+                "missing_device_id",
+            ),
+        )
 
     def test_rejects_invalid_utf8(self):
         self.assert_rejection_is_recoverable(b'\xff\n', "invalid_utf8")
@@ -35,7 +87,7 @@ class JsonlStreamParserTest(unittest.TestCase):
 
     def test_rejects_record_without_a_nonempty_string_device_id(self):
         for data in (
-            b'{}\n',
+            b"{}\n",
             b'{"deviceId":""}\n',
             b'{"deviceId":1}\n',
             b'{"deviceId":null}\n',
@@ -46,14 +98,17 @@ class JsonlStreamParserTest(unittest.TestCase):
 
     def test_rejects_device_id_change_after_first_accepted_record(self):
         parser = JsonlStreamParser(64)
+        first_line = b'{"deviceId":"D1"}\n'
+        changed_line = b'{"deviceId":"D2"}\n'
 
-        parser.feed(b'{"deviceId":"D1"}\n')
+        result = parser.feed(first_line + changed_line + first_line)
 
-        with self.assertRaises(RecordRejected) as context:
-            parser.feed(b'{"deviceId":"D2"}\n')
-
-        self.assertEqual("device_id_changed", context.exception.reason)
-        self.assert_accepted_d1(parser.feed(b'{"deviceId":"D1"}\n'))
+        self.assert_result(
+            result,
+            raw_lines=(first_line, first_line),
+            device_ids=("D1", "D1"),
+            reasons=("device_id_changed",),
+        )
 
     def test_accepts_line_at_exactly_the_limit_when_newline_arrives_later(self):
         prefix = b'{"deviceId":"D1","padding":"'
@@ -62,49 +117,74 @@ class JsonlStreamParserTest(unittest.TestCase):
         parser = JsonlStreamParser(64)
 
         self.assertEqual(64, len(line))
-        self.assertEqual([], parser.feed(line))
-        records = parser.feed(b"\n")
+        self.assert_empty_result(parser.feed(line))
+        result = parser.feed(b"\n")
 
-        self.assertEqual([line + b"\n"], [record.raw_line for record in records])
-        self.assertEqual(["D1"], [record.device_id for record in records])
+        self.assert_result(
+            result,
+            raw_lines=(line + b"\n",),
+            device_ids=("D1",),
+        )
 
-    def test_rejects_unterminated_line_that_exceeds_limit(self):
+    def test_rejects_unterminated_line_that_exceeds_limit_and_closes_connection(self):
         parser = JsonlStreamParser(64)
 
-        with self.assertRaises(RecordRejected) as context:
-            parser.feed(b"x" * 65)
+        result = parser.feed(b"x" * 65)
 
-        self.assertEqual("line_too_long", context.exception.reason)
-        self.assert_accepted_d1(parser.feed(b'{"deviceId":"D1"}\n'))
+        self.assert_result(
+            result,
+            reasons=("line_too_long",),
+            close_connection=True,
+        )
+        self.assert_empty_result(parser.feed(b""))
 
     def test_clears_buffer_after_complete_line_exceeds_limit(self):
         parser = JsonlStreamParser(64)
         valid_line = b'{"deviceId":"D1"}\n'
 
-        with self.assertRaises(RecordRejected) as context:
-            parser.feed(b"x" * 65 + b"\n" + valid_line)
+        result = parser.feed(b"x" * 65 + b"\n" + valid_line)
 
-        self.assertEqual("line_too_long", context.exception.reason)
-        self.assertEqual([], parser.feed(b""))
-        self.assert_accepted_d1(parser.feed(valid_line))
+        self.assert_result(
+            result,
+            reasons=("line_too_long",),
+            close_connection=True,
+        )
+        self.assert_empty_result(parser.feed(b""))
 
     def test_rejects_incomplete_line_at_end_of_stream(self):
         parser = JsonlStreamParser(64)
-        parser.feed(b'{"deviceId":"D1"}')
+        self.assert_empty_result(parser.feed(b'{"deviceId":"D1"}'))
 
-        with self.assertRaises(RecordRejected) as context:
-            parser.finish()
+        result = parser.finish()
 
-        self.assertEqual("incomplete_line", context.exception.reason)
+        self.assert_result(result, reasons=("incomplete_line",))
 
     def assert_rejection_is_recoverable(self, data, reason):
         parser = JsonlStreamParser(64)
-        with self.assertRaises(RecordRejected) as context:
-            parser.feed(data)
 
-        self.assertEqual(reason, context.exception.reason)
+        self.assert_result(parser.feed(data), reasons=(reason,))
         self.assert_accepted_d1(parser.feed(b'{"deviceId":"D1"}\n'))
 
-    def assert_accepted_d1(self, records):
-        self.assertEqual([b'{"deviceId":"D1"}\n'], [record.raw_line for record in records])
-        self.assertEqual(["D1"], [record.device_id for record in records])
+    def assert_accepted_d1(self, result):
+        self.assert_result(
+            result,
+            raw_lines=(b'{"deviceId":"D1"}\n',),
+            device_ids=("D1",),
+        )
+
+    def assert_empty_result(self, result):
+        self.assert_result(result)
+
+    def assert_result(
+        self,
+        result,
+        raw_lines=(),
+        device_ids=(),
+        reasons=(),
+        close_connection=False,
+    ):
+        self.assertIsInstance(result, FeedResult)
+        self.assertEqual(raw_lines, tuple(record.raw_line for record in result.records))
+        self.assertEqual(device_ids, tuple(record.device_id for record in result.records))
+        self.assertEqual(reasons, tuple(error.reason for error in result.rejections))
+        self.assertEqual(close_connection, result.close_connection)

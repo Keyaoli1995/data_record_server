@@ -21,6 +21,19 @@ class RecordRejected(ValueError):
         self.reason = reason
 
 
+@dataclass(frozen=True)
+class FeedResult:
+    """The accepted and rejected records produced by one parser operation."""
+
+    records: tuple[AcceptedRecord, ...]
+    rejections: tuple[RecordRejected, ...]
+    close_connection: bool = False
+
+    @classmethod
+    def empty(cls) -> "FeedResult":
+        return cls((), ())
+
+
 def _reject_non_standard_json_constant(constant: str) -> None:
     raise ValueError(f"Non-standard JSON constant: {constant}")
 
@@ -35,55 +48,61 @@ class JsonlStreamParser:
         self._buffer = bytearray()
         self._device_id: Optional[str] = None
 
-    def feed(self, data: bytes) -> list[AcceptedRecord]:
-        """Consume bytes and return each complete, valid JSONL record."""
+    def feed(self, data: bytes) -> FeedResult:
+        """Consume bytes and report all complete records in the input buffer."""
         self._buffer.extend(data)
         records = []
+        rejections = []
 
         while True:
             newline_index = self._buffer.find(b"\n")
             if newline_index < 0:
                 if len(self._buffer) > self._max_line_bytes:
                     self._buffer.clear()
-                    raise RecordRejected("line_too_long")
-                return records
+                    return FeedResult((), (RecordRejected("line_too_long"),), True)
+                return FeedResult(tuple(records), tuple(rejections))
 
             raw_line = bytes(self._buffer[: newline_index + 1])
             del self._buffer[: newline_index + 1]
             if len(raw_line) - 1 > self._max_line_bytes:
                 self._buffer.clear()
-                raise RecordRejected("line_too_long")
+                return FeedResult((), (RecordRejected("line_too_long"),), True)
 
-            records.append(self._parse_line(raw_line))
+            parsed_line = self._parse_line(raw_line)
+            if isinstance(parsed_line, RecordRejected):
+                rejections.append(parsed_line)
+            else:
+                records.append(parsed_line)
 
-    def finish(self) -> None:
-        """Confirm that the stream ended on a record boundary."""
+    def finish(self) -> FeedResult:
+        """Report whether the stream ended on a record boundary."""
         if self._buffer:
-            raise RecordRejected("incomplete_line")
+            return FeedResult((), (RecordRejected("incomplete_line"),))
+        return FeedResult.empty()
 
-    def _parse_line(self, raw_line: bytes) -> AcceptedRecord:
+    def _parse_line(self, raw_line: bytes) -> AcceptedRecord | RecordRejected:
         try:
             decoded_line = raw_line.decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise RecordRejected("invalid_utf8") from error
+        except UnicodeDecodeError:
+            return RecordRejected("invalid_utf8")
 
         try:
             value = json.loads(
                 decoded_line, parse_constant=_reject_non_standard_json_constant
             )
-        except (json.JSONDecodeError, ValueError) as error:
-            raise RecordRejected("invalid_json") from error
+        except (json.JSONDecodeError, ValueError):
+            return RecordRejected("invalid_json")
 
         if not isinstance(value, dict):
-            raise RecordRejected("json_not_object")
+            return RecordRejected("json_not_object")
 
         device_id = value.get("deviceId")
         if type(device_id) is not str or not device_id:
-            raise RecordRejected("missing_device_id")
+            return RecordRejected("missing_device_id")
 
         if self._device_id is None:
             self._device_id = device_id
         elif device_id != self._device_id:
-            raise RecordRejected("device_id_changed")
+            return RecordRejected("device_id_changed")
 
         return AcceptedRecord(device_id=device_id, raw_line=raw_line)
