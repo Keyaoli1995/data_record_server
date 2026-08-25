@@ -5,8 +5,8 @@ import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import BinaryIO, Callable, Dict, Set, Tuple
-from urllib.parse import quote
+from typing import BinaryIO, Callable, Dict, Optional, Set, Tuple
+from urllib.parse import quote_from_bytes
 
 Clock = Callable[[], datetime]
 ClientAddress = Tuple[str, int]
@@ -30,7 +30,7 @@ class JsonlEventWriter:
         self._lock = threading.Lock()
 
     def write(self, event: Dict[str, object]) -> None:
-        line = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+        line = json.dumps(event, ensure_ascii=True, separators=(",", ":"))
         with self._lock:
             with self._path.open("a", encoding="utf-8") as stream:
                 stream.write(line + "\n")
@@ -46,16 +46,14 @@ class DeviceSession:
         relative_path: str,
         stream: BinaryIO,
         events: JsonlEventWriter,
-        clock: Clock,
     ) -> None:
         self.device_id = device_id
         self.relative_path = relative_path
         self._stream = stream
         self._events = events
-        self._clock = clock
         self._attached_clients: Set[ClientAddress] = set()
         self._total_bytes = 0
-        self._last_valid_record_at = None  # type: datetime
+        self._last_valid_record_at: Optional[datetime] = None
         self._closed = False
         self._lock = threading.Lock()
 
@@ -94,17 +92,27 @@ class DeviceSession:
             timeout = timedelta(seconds=idle_timeout_seconds)
             if now - self._last_valid_record_at < timeout:
                 return False
-            self._events.write(
-                {
-                    "event": "session_idle_timeout",
-                    "time": format_time(now),
-                    "file": self.relative_path,
-                    "device_id": self.device_id,
-                    "idle_timeout_seconds": idle_timeout_seconds,
-                    "total_bytes": self._total_bytes,
-                }
-            )
-            self._close_locked("idle_timeout", now)
+            idle_error = None  # type: Optional[BaseException]
+            try:
+                self._events.write(
+                    {
+                        "event": "session_idle_timeout",
+                        "time": format_time(now),
+                        "file": self.relative_path,
+                        "device_id": self.device_id,
+                        "idle_timeout_seconds": idle_timeout_seconds,
+                        "total_bytes": self._total_bytes,
+                    }
+                )
+            except BaseException as error:
+                idle_error = error
+            try:
+                self._close_locked("idle_timeout", now)
+            except BaseException as error:
+                if idle_error is None:
+                    idle_error = error
+            if idle_error is not None:
+                raise idle_error
             return True
 
     def close(self, reason: str, closed_at: datetime) -> bool:
@@ -125,17 +133,27 @@ class DeviceSession:
 
     def _close_locked(self, reason: str, closed_at: datetime) -> None:
         self._closed = True
-        self._stream.close()
-        self._events.write(
-            {
-                "event": "session_closed",
-                "time": format_time(closed_at),
-                "file": self.relative_path,
-                "device_id": self.device_id,
-                "total_bytes": self._total_bytes,
-                "reason": reason,
-            }
-        )
+        close_error = None  # type: Optional[BaseException]
+        try:
+            self._stream.close()
+        except BaseException as error:
+            close_error = error
+        try:
+            self._events.write(
+                {
+                    "event": "session_closed",
+                    "time": format_time(closed_at),
+                    "file": self.relative_path,
+                    "device_id": self.device_id,
+                    "total_bytes": self._total_bytes,
+                    "reason": reason,
+                }
+            )
+        except BaseException as error:
+            if close_error is None:
+                close_error = error
+        if close_error is not None:
+            raise close_error
 
 
 class Storage:
@@ -177,24 +195,42 @@ class Storage:
     def expire_sessions(self, idle_timeout_seconds: float) -> None:
         """Close and remove device sessions that have reached their idle timeout."""
         now = self._clock()
+        first_error = None  # type: Optional[BaseException]
         with self._sessions_lock:
             expired_device_ids = []
             for device_id, session in self._sessions.items():
-                if session.close_if_expired(now, idle_timeout_seconds):
+                try:
+                    expired = session.close_if_expired(now, idle_timeout_seconds)
+                except BaseException as error:
+                    expired = True
+                    if first_error is None:
+                        first_error = error
+                if expired:
                     expired_device_ids.append(device_id)
             for device_id in expired_device_ids:
                 del self._sessions[device_id]
+        if first_error is not None:
+            raise first_error
 
     def close_all_sessions(self) -> None:
         """Close every active session once as part of server shutdown."""
         with self._sessions_lock:
             sessions = tuple(self._sessions.values())
             self._sessions.clear()
+        first_error = None  # type: Optional[BaseException]
         for session in sessions:
-            session.close("server_shutdown", self._clock())
+            try:
+                session.close("server_shutdown", self._clock())
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
 
     def _create_session(self, device_id: str) -> DeviceSession:
-        escaped_device_id = quote(device_id, safe="")
+        escaped_device_id = quote_from_bytes(
+            device_id.encode("utf-8", "surrogatepass")
+        )
         directory = self._data_dir / "devices" / ("device-" + escaped_device_id)
         timestamp = format_time(self._clock())
         filename = "{}_{}_{}.jsonl".format(
@@ -205,9 +241,7 @@ class Storage:
 
         directory.mkdir(parents=True, exist_ok=True)
         stream = path.open("xb")
-        session = DeviceSession(
-            device_id, relative_path, stream, self._events, self._clock
-        )
+        session = DeviceSession(device_id, relative_path, stream, self._events)
         try:
             self._events.write(
                 {
@@ -218,7 +252,10 @@ class Storage:
                 }
             )
         except BaseException:
-            session.abandon()
+            try:
+                session.abandon()
+            except BaseException:
+                pass
             try:
                 path.unlink()
             except OSError:

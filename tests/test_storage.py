@@ -6,6 +6,7 @@ import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 from data_record_server.storage import Storage
 
@@ -290,6 +291,89 @@ class StorageTest(unittest.TestCase):
         self.assertEqual(
             {"server_shutdown"}, {event["reason"] for event in closed_events}
         )
+
+    def test_records_a_lone_surrogate_device_id_using_a_safe_path_and_event(self):
+        device_id = "\ud800"
+        raw_line = b'{"deviceId":"surrogate"}\n'
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(directory)
+            session = storage.append_record(
+                ("203.0.113.11", 5011), device_id, raw_line
+            )
+
+            self.assertIn("device-%ED%A0%80", session.relative_path)
+            self.assertTrue(session.relative_path.endswith(".jsonl"))
+            self.assertEqual(
+                raw_line, (Path(directory) / session.relative_path).read_bytes()
+            )
+            storage.close_all_sessions()
+            events = self._read_events(directory)
+
+        self.assertEqual(device_id, events[0]["device_id"])
+        self.assertEqual(device_id, events[-1]["device_id"])
+
+    def test_expire_removes_a_session_when_its_stream_close_fails(self):
+        clock = MutableUtcClock(datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc))
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(directory, clock=clock)
+            first = storage.append_record(
+                ("203.0.113.12", 5012), "D1", b'{"deviceId":"D1"}\n'
+            )
+            original_stream = first._stream
+            failing_stream = mock.Mock()
+
+            def close_then_fail():
+                original_stream.close()
+                raise OSError("close failed")
+
+            failing_stream.close.side_effect = close_then_fail
+            first._stream = failing_stream
+            clock.advance(30)
+
+            with self.assertRaisesRegex(OSError, "close failed"):
+                storage.expire_sessions(idle_timeout_seconds=30)
+
+            replacement = storage.append_record(
+                ("203.0.113.12", 5012), "D1", b'{"deviceId":"D1","n":2}\n'
+            )
+            storage.close_all_sessions()
+
+        self.assertNotEqual(first.relative_path, replacement.relative_path)
+
+    def test_close_all_continues_after_a_close_event_write_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(directory)
+            first = storage.append_record(
+                ("203.0.113.13", 5013), "D1", b'{"deviceId":"D1"}\n'
+            )
+            second = storage.append_record(
+                ("203.0.113.14", 5014), "D2", b'{"deviceId":"D2"}\n'
+            )
+            events = first._events
+            failing_events = mock.Mock()
+
+            def fail_only_close(event):
+                if event["event"] == "session_closed":
+                    raise OSError("event write failed")
+                events.write(event)
+
+            failing_events.write.side_effect = fail_only_close
+            first._events = failing_events
+            second_stream = mock.Mock(wraps=second._stream)
+            second._stream = second_stream
+
+            with self.assertRaisesRegex(OSError, "event write failed"):
+                storage.close_all_sessions()
+
+            replacement = storage.append_record(
+                ("203.0.113.14", 5014), "D2", b'{"deviceId":"D2","n":2}\n'
+            )
+            storage.close_all_sessions()
+
+        second_stream.close.assert_called_once_with()
+        self.assertNotEqual(second.relative_path, replacement.relative_path)
 
     @staticmethod
     def _read_events(directory):
