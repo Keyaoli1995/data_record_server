@@ -56,6 +56,7 @@ class DeploymentFilesTest(unittest.TestCase):
             "DATA_DIR": "/data",
             "READ_BUFFER_BYTES": "4096",
             "IDLE_TIMEOUT_SECONDS": "30",
+            "MAX_JSON_LINE_BYTES": "65536",
         }.items():
             self.assertIn(f"{name}={value}", environment)
         self.assertIn(f"ARG COLLECTOR_UID={DEFAULT_UID}", instructions)
@@ -100,6 +101,7 @@ class DeploymentFilesTest(unittest.TestCase):
                 "DATA_DIR": "/data",
                 "READ_BUFFER_BYTES": "${READ_BUFFER_BYTES:-4096}",
                 "IDLE_TIMEOUT_SECONDS": "${IDLE_TIMEOUT_SECONDS:-30}",
+                "MAX_JSON_LINE_BYTES": "${MAX_JSON_LINE_BYTES:-65536}",
             },
             collector["environment"],
         )
@@ -175,7 +177,7 @@ class DeploymentFilesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             repository, script = self._copy_preparation_script(temporary_directory)
             data_dir = repository / "data"
-            sample_file = data_dir / "connections" / "sample.bin"
+            sample_file = data_dir / "devices" / "device-D1" / "sample.jsonl"
             sample_file.parent.mkdir(parents=True)
             sample_file.write_bytes(b"captured bytes")
             external_data_dir = Path(temporary_directory) / "external-data"
@@ -218,12 +220,10 @@ class DeploymentFilesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             repository, script = self._copy_preparation_script(temporary_directory)
             data_dir = repository / "data"
-            connections_dir = data_dir / "connections"
-            connections_dir.mkdir(parents=True)
+            data_dir.mkdir()
             events_file = data_dir / "events.jsonl"
             sentinel_events = b'{"event":"existing"}\n'
             events_file.write_bytes(sentinel_events)
-            connections_dir.chmod(0o500)
             events_file.chmod(0o400)
             collector_uid, collector_gid = self._collector_identity()
             result = subprocess.run(
@@ -242,22 +242,22 @@ class DeploymentFilesTest(unittest.TestCase):
 
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertEqual(0o750, stat.S_IMODE(data_dir.stat().st_mode))
-            self.assertEqual(0o750, stat.S_IMODE(connections_dir.stat().st_mode))
             self.assertEqual(0o640, stat.S_IMODE(events_file.stat().st_mode))
-            for path in (data_dir, connections_dir, events_file):
+            for path in (data_dir, events_file):
                 path_stat = path.stat()
                 self.assertEqual(collector_uid, path_stat.st_uid)
                 self.assertEqual(collector_gid, path_stat.st_gid)
             self.assertEqual(sentinel_events, events_file.read_bytes())
 
             storage = Storage(data_dir)
-            recorder = storage.open_connection(("127.0.0.1", 30050))
-            recorder.record_received(b"probe bytes")
-            recorder.close()
+            storage.append_record(
+                ("127.0.0.1", 30050), "D1", b'{"deviceId":"D1"}\n'
+            )
+            storage.close_all_sessions()
 
-            connection_files = list(connections_dir.glob("*.bin"))
-            self.assertEqual(1, len(connection_files))
-            self.assertEqual(b"probe bytes", connection_files[0].read_bytes())
+            session_files = list((data_dir / "devices" / "device-D1").glob("*.jsonl"))
+            self.assertEqual(1, len(session_files))
+            self.assertEqual(b'{"deviceId":"D1"}\n', session_files[0].read_bytes())
             updated_events = events_file.read_bytes()
             self.assertTrue(updated_events.startswith(sentinel_events))
             self.assertGreater(len(updated_events), len(sentinel_events))
@@ -267,7 +267,7 @@ class DeploymentFilesTest(unittest.TestCase):
             repository, script = self._copy_preparation_script(temporary_directory)
             sentinel_directory = Path(temporary_directory) / "sentinel"
             sentinel_directory.mkdir()
-            sentinel_file = sentinel_directory / "do-not-touch.bin"
+            sentinel_file = sentinel_directory / "do-not-touch.jsonl"
             sentinel_file.write_bytes(b"sentinel")
             sentinel_stat = sentinel_directory.stat()
             (repository / "data").symlink_to(sentinel_directory, target_is_directory=True)
@@ -298,29 +298,106 @@ class DeploymentFilesTest(unittest.TestCase):
                 stat.S_IMODE(updated_sentinel_stat.st_mode),
             )
 
+    def test_prepare_data_dir_script_refuses_a_devices_directory_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository, script = self._copy_preparation_script(temporary_directory)
+            data_dir = repository / "data"
+            data_dir.mkdir()
+            external_directory = Path(temporary_directory) / "external-devices"
+            external_directory.mkdir()
+            sentinel_file = external_directory / "do-not-touch.jsonl"
+            sentinel_file.write_bytes(b"sentinel")
+            sentinel_stat = sentinel_file.stat()
+            (data_dir / "devices").symlink_to(external_directory, target_is_directory=True)
+            collector_uid, collector_gid = self._collector_identity()
+
+            result = subprocess.run(
+                [str(script)],
+                cwd=repository,
+                env=os.environ
+                | {
+                    "COLLECTOR_UID": str(collector_uid),
+                    "COLLECTOR_GID": str(collector_gid),
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("symlink", result.stderr.lower())
+            self.assertEqual(b"sentinel", sentinel_file.read_bytes())
+            updated_sentinel_stat = sentinel_file.stat()
+            self.assertEqual(sentinel_stat.st_uid, updated_sentinel_stat.st_uid)
+            self.assertEqual(sentinel_stat.st_gid, updated_sentinel_stat.st_gid)
+            self.assertEqual(
+                stat.S_IMODE(sentinel_stat.st_mode),
+                stat.S_IMODE(updated_sentinel_stat.st_mode),
+            )
+
+    def test_prepare_data_dir_script_refuses_a_device_session_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository, script = self._copy_preparation_script(temporary_directory)
+            data_dir = repository / "data"
+            devices_dir = data_dir / "devices"
+            devices_dir.mkdir(parents=True)
+            external_directory = Path(temporary_directory) / "external-session"
+            external_directory.mkdir()
+            sentinel_file = external_directory / "do-not-touch.jsonl"
+            sentinel_file.write_bytes(b"sentinel")
+            sentinel_stat = sentinel_file.stat()
+            (devices_dir / "device-D1").symlink_to(
+                external_directory, target_is_directory=True
+            )
+            collector_uid, collector_gid = self._collector_identity()
+
+            result = subprocess.run(
+                [str(script)],
+                cwd=repository,
+                env=os.environ
+                | {
+                    "COLLECTOR_UID": str(collector_uid),
+                    "COLLECTOR_GID": str(collector_gid),
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("symlink", result.stderr.lower())
+            self.assertEqual(b"sentinel", sentinel_file.read_bytes())
+            updated_sentinel_stat = sentinel_file.stat()
+            self.assertEqual(sentinel_stat.st_uid, updated_sentinel_stat.st_uid)
+            self.assertEqual(sentinel_stat.st_gid, updated_sentinel_stat.st_gid)
+            self.assertEqual(
+                stat.S_IMODE(sentinel_stat.st_mode),
+                stat.S_IMODE(updated_sentinel_stat.st_mode),
+            )
+
     def test_prepare_data_dir_script_rejects_unsafe_key_paths(self):
-        for path_kind in ("connections-symlink", "events-symlink", "events-directory"):
+        for path_kind in ("data-symlink", "events-symlink", "events-directory"):
             with self.subTest(path_kind=path_kind), tempfile.TemporaryDirectory() as temporary_directory:
                 repository, script = self._copy_preparation_script(temporary_directory)
                 data_dir = repository / "data"
-                data_dir.mkdir()
-                connections_dir = data_dir / "connections"
                 events_file = data_dir / "events.jsonl"
                 external_path = Path(temporary_directory) / "external"
-                if path_kind == "connections-symlink":
+                if path_kind == "data-symlink":
                     external_path.mkdir()
-                    sentinel_file = external_path / "sentinel.bin"
+                    sentinel_file = external_path / "sentinel.jsonl"
                     sentinel_file.write_bytes(b"outside")
-                    connections_dir.symlink_to(external_path, target_is_directory=True)
+                    data_dir.symlink_to(external_path, target_is_directory=True)
                 elif path_kind == "events-symlink":
-                    connections_dir.mkdir()
+                    data_dir.mkdir()
                     external_path.write_bytes(b"outside")
                     sentinel_file = external_path
                     events_file.symlink_to(external_path)
                 else:
-                    connections_dir.mkdir()
+                    data_dir.mkdir()
                     events_file.mkdir()
-                    sentinel_file = events_file / "sentinel.bin"
+                    sentinel_file = events_file / "sentinel.jsonl"
                     sentinel_file.write_bytes(b"inside unexpected object")
                 sentinel_stat = sentinel_file.stat()
                 sentinel_bytes = sentinel_file.read_bytes()
@@ -358,13 +435,11 @@ class DeploymentFilesTest(unittest.TestCase):
             with self.subTest(environment_override=environment_override), tempfile.TemporaryDirectory() as temporary_directory:
                 repository, script = self._copy_preparation_script(temporary_directory)
                 data_dir = repository / "data"
-                connections_dir = data_dir / "connections"
-                connections_dir.mkdir(parents=True)
+                devices_dir = data_dir / "devices" / "device-D1"
+                devices_dir.mkdir(parents=True)
                 events_file = data_dir / "events.jsonl"
                 events_file.write_bytes(b'{"event":"sentinel"}\n')
-                original_stats = {
-                    path: path.stat() for path in (data_dir, connections_dir, events_file)
-                }
+                original_stats = {path: path.stat() for path in (data_dir, events_file)}
 
                 result = subprocess.run(
                     [str(script)],
@@ -401,18 +476,18 @@ class DeploymentFilesTest(unittest.TestCase):
             repository, script = self._copy_preparation_script(temporary_directory)
             data_dir = repository / "data"
             data_dir.mkdir()
-            connections_dir = data_dir / "connections"
-            connections_dir.mkdir()
-            sample_file = connections_dir / "sample.bin"
+            devices_dir = data_dir / "devices" / "device-D1"
+            devices_dir.mkdir(parents=True)
+            sample_file = devices_dir / "sample.jsonl"
             sample_file.write_bytes(b"captured bytes")
-            connections_dir.chmod(0o500)
+            devices_dir.chmod(0o500)
             sample_file.chmod(0o440)
             events_file = data_dir / "events.jsonl"
             events_file.write_bytes(b'{"event":"existing"}\n')
             events_file.chmod(0o400)
             original_stats = {
                 path: path.stat()
-                for path in (data_dir, connections_dir, sample_file, events_file)
+                for path in (data_dir, devices_dir, sample_file, events_file)
             }
             target_uid = 10001 if os.getuid() == 0 else os.getuid() + 1
             target_gid = 10001 if os.getuid() == 0 else os.getgid() + 1
@@ -443,20 +518,18 @@ class DeploymentFilesTest(unittest.TestCase):
                     )
                     self.assertEqual(0, first_result.returncode, first_result.stderr)
                     self.assertEqual(0, second_result.returncode, second_result.stderr)
-                    for path in (data_dir, connections_dir, sample_file, events_file):
+                    for path in (data_dir, devices_dir, sample_file, events_file):
                         path_stat = path.stat()
                         self.assertEqual(target_uid, path_stat.st_uid)
                         self.assertEqual(target_gid, path_stat.st_gid)
                     self.assertEqual(0o750, stat.S_IMODE(data_dir.stat().st_mode))
-                    self.assertEqual(
-                        0o750, stat.S_IMODE(connections_dir.stat().st_mode)
-                    )
+                    self.assertEqual(0o500, stat.S_IMODE(devices_dir.stat().st_mode))
                     self.assertEqual(0o640, stat.S_IMODE(events_file.stat().st_mode))
                     self.assertEqual(0o440, stat.S_IMODE(sample_file.stat().st_mode))
                     self.assertEqual(b"captured bytes", sample_file.read_bytes())
                     self.assertEqual(b'{"event":"existing"}\n', events_file.read_bytes())
                 finally:
-                    for path in (sample_file, events_file, connections_dir, data_dir):
+                    for path in (sample_file, events_file, devices_dir, data_dir):
                         os.chown(path, os.getuid(), os.getgid())
             else:
                 self.assertNotEqual(0, first_result.returncode)

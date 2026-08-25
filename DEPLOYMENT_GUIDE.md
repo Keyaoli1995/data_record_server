@@ -1,365 +1,112 @@
-可以。按当前项目的默认配置，部署后数据路径是：
+# 部署指南
 
-```text
-App
-  → 8.134.210.73:30050
-  → 阿里云安全组
-  → Docker 端口映射
-  → TCP 接收程序
-  → /opt/data_record_server/data/
-```
+以下示例假设服务器地址为 `8.134.210.73`、项目目录为 `/opt/data_record_server`，并使用默认 TCP 端口 `30050`。
 
-下面按“在哪执行、执行什么、有什么作用”说明。
+## 上传并检查环境
 
-## 第一步：把项目上传到服务器
-
-在你本地电脑执行，不是在服务器上执行：
-
-```bash
-cd /home/keyaoli/Code/Wayrobo/manual_raking_trajectory
-
-scp -r data_record_server root@8.134.210.73:/opt/
-```
-
-输入服务器密码后，项目会被复制到：
-
-```text
-/opt/data_record_server
-```
-
-含义：服务器必须拿到程序源码、`Dockerfile` 和 `compose.yaml`，才能构建并运行接收服务。
-
-如果以后只想同步修改后的代码，可以使用 `rsync`：
+在本地执行：
 
 ```bash
 rsync -av \
   --exclude='.git/' \
   --exclude='.venv/' \
   --exclude='data/' \
-  data_record_server/ \
-  root@8.134.210.73:/opt/data_record_server/
-```
-
-排除 `data/` 是为了防止覆盖服务器已经采集的数据。
-
-## 第二步：登录服务器并进入项目目录
-
-在本地执行：
-
-```bash
+  data_record_server/ root@8.134.210.73:/opt/data_record_server/
 ssh root@8.134.210.73
-```
-
-登录后执行：
-
-```bash
 cd /opt/data_record_server
-pwd
-ls
-```
-
-正常应该能看到：
-
-```text
-Dockerfile
-README.md
-compose.yaml
-data_record_server
-scripts
-tests
-```
-
-后续命令都默认在这个目录执行。
-
-## 第三步：检查 Docker 环境
-
-```bash
 docker --version
 docker compose version
 ```
 
-两个命令都能显示版本号，才具备直接部署条件。
+`data/` 被排除，避免发布代码覆盖已经录制的设备归档。
 
-它们的区别是：
+## 准备数据目录并启动
 
-- `docker`：负责构建和运行容器。
-- `docker compose`：读取 `compose.yaml`，统一配置端口、目录、重启策略等。
-
-如果第二条提示 `docker: 'compose' is not a docker command`，暂时不要继续，把输出发给我，需要根据服务器系统安装 Compose 插件。
-
-## 第四步：确认端口配置
-
-当前项目默认使用：
-
-```text
-TCP 30050
-```
-
-所以现在不需要创建 `.env` 文件。`compose.yaml` 中已经把默认端口设为 `30050`，并把每条连接的空闲超时设为 30 秒。
-
-如果一条连接连续 30 秒没有收到任何数据，服务会主动关闭它，并结束对应的原始文件。每次收到数据都会重新开始计时；当前约 1 秒一次的设备回传频率适合使用这个默认值。若设备有超过 30 秒的正常静默期，需要在 `.env` 中设置更大的 `IDLE_TIMEOUT_SECONDS` 正整数后重启服务。
-
-阿里云安全组需要有入方向规则：
-
-```text
-协议：TCP
-端口：30050
-来源：测试时可临时使用 0.0.0.0/0
-```
-
-安全组只是允许网络流量进入服务器，并不负责监听端口。真正的监听由后面启动的 TCP 程序完成。
-
-## 第五步：准备数据保存目录
-
-你使用的是 `root`，在服务器项目目录执行：
+默认 UID/GID 为 `10001:10001`：
 
 ```bash
+cd /opt/data_record_server
 chmod +x scripts/prepare-data-dir.sh
 ./scripts/prepare-data-dir.sh
-```
-
-检查结果：
-
-```bash
-ls -ldn data data/connections
-```
-
-这里主要做三件事：
-
-- 创建 `data/` 和 `data/connections/`。
-- 设置合理的文件权限。
-- 将目录所有者设置为容器使用的 `10001:10001`。
-
-为什么要设置这个权限：容器里的 TCP 程序不是以 `root` 运行，而是以 UID/GID `10001:10001` 运行。如果目录不可写，App 虽然可能连接成功，但数据保存会失败。
-
-## 第六步：检查 Compose 配置
-
-```bash
 docker compose config --quiet
-```
-
-含义：让 Docker 检查 `compose.yaml` 的语法和变量是否有效。
-
-正常情况下没有输出，返回到命令提示符就是成功。如果有错误，先不要启动，把错误信息发给我。
-
-你也可以查看展开后的完整配置：
-
-```bash
-docker compose config
-```
-
-其中应该能看到类似端口映射：
-
-```text
-30050:30050
-```
-
-左侧是服务器端口，右侧是容器内部端口。
-
-## 第七步：构建并启动接收程序
-
-```bash
 docker compose up -d --build
-```
-
-各参数含义：
-
-- `up`：创建并启动服务。
-- `--build`：根据 `Dockerfile` 重新构建程序镜像。
-- `-d`：在后台运行，退出 SSH 后程序也不会停止。
-
-第一次运行可能会下载 Python 基础镜像，需要稍等一会。
-
-这个命令还会自动完成：
-
-- 启动 TCP 接收程序。
-- 监听容器内的 `0.0.0.0:30050`。
-- 将服务器的 `30050` 映射到容器的 `30050`。
-- 将服务器的 `./data` 挂载到容器的 `/data`。
-- 配置异常退出后自动重启。
-
-## 第八步：检查是否启动成功
-
-先看容器状态：
-
-```bash
 docker compose ps
-```
-
-正常状态应该是 `Up` 或 `running`，并能看到类似：
-
-```text
-0.0.0.0:30050->30050/tcp
-```
-
-查看程序日志：
-
-```bash
 docker compose logs --tail=100 collector
 ```
 
-确认 Docker 端口映射：
+准备脚本只处理项目内的 `data/`，拒绝 `data/`、`data/devices/` 以及后者下直接 `device-*` 会话目录的符号链接，并使容器非 root 身份可创建 `data/devices/device-<URL-escaped-deviceId>/` 下的归档。请勿把这些路径替换为指向项目外的链接；遇到权限问题也不要把容器改为 root。
+
+如需自定义端口、会话空闲超时、行长上限或 UID/GID，在项目根目录创建不提交的 `.env`：
+
+```dotenv
+COLLECTOR_UID=1000
+COLLECTOR_GID=1000
+TCP_PORT=30100
+IDLE_TIMEOUT_SECONDS=45
+MAX_JSON_LINE_BYTES=65536
+```
+
+随后以相同 UID/GID 准备目录并启动：
+
+```bash
+sudo env COLLECTOR_UID=1000 COLLECTOR_GID=1000 scripts/prepare-data-dir.sh
+docker compose config --quiet
+docker compose up -d --build
+```
+
+`MAX_JSON_LINE_BYTES` 默认 `65536`，是单条 JSONL 内容（不含换行符）的上限；它不同于 `READ_BUFFER_BYTES` 的 socket 读取块大小。所有数值应为正整数，端口必须在 `1` 至 `65535`。
+
+## 网络放行
+
+在阿里云安全组和宿主机防火墙中，为实际端口创建 TCP 入方向规则，并限制到设备/运维网络的来源 IP。不要长期使用 `0.0.0.0/0`。安全组只允许流量进入，监听由容器中的服务完成。
+
+检查发布端口：
 
 ```bash
 docker compose port collector 30050
+sudo ss -ltnp | grep ':30050'
 ```
 
-预期类似：
+`docker compose port` 是 Docker 映射的准确信息；`ss` 仅作宿主机辅助观察。
 
-```text
-0.0.0.0:30050
-```
+## 验证设备记录
 
-还可以辅助检查：
-
-```bash
-ss -ltnp | grep ':30050'
-```
-
-但 Docker 某些网络模式下，`ss` 不一定显示 `docker-proxy`，所以应结合 `docker compose ps` 和公网连接测试判断，不能只看 `ss`。
-
-## 第九步：从另一台电脑测试公网连接
-
-回到你的本地电脑执行：
-
-```bash
-nc -vz 8.134.210.73 30050
-```
-
-成功时通常显示：
-
-```text
-Connection to 8.134.210.73 30050 port [tcp/*] succeeded!
-```
-
-这能证明以下链路已经连通：
-
-```text
-本地电脑 → 公网 → 阿里云安全组 → 服务器 → Docker → 接收程序
-```
-
-如果电脑没有 `nc`，可用 Python 测试，并发送一段测试数据：
+从可访问服务器的客户端发送一条符合契约的 JSONL 记录：
 
 ```bash
 python3 - <<'PY'
 import socket
 
 with socket.create_connection(("8.134.210.73", 30050), timeout=5) as sock:
-    sock.sendall(b"hello-test")
+    sock.sendall(b'{"deviceId":"deploy-check","sequence":1}\n')
 
-print("连接成功，测试数据已发送")
+print("已发送 JSONL 测试记录")
 PY
 ```
 
-## 第十步：检查测试数据是否落盘
-
-回到服务器项目目录：
+回到服务器检查：
 
 ```bash
 cd /opt/data_record_server
-```
-
-查看事件记录：
-
-```bash
 tail -n 50 data/events.jsonl
+find data/devices -type f -name '*.jsonl' -print
+first_jsonl=$(find data/devices -type f -name '*.jsonl' -print -quit)
+[ -z "$first_jsonl" ] || sed -n '1,20p' "$first_jsonl"
 ```
 
-应该看到：
+预期可看到 `data/devices/device-deploy-check/` 下的 `.jsonl`，内容包含刚发送的完整行；事件通常先出现 `session_started`、`session_attached`。从最后一条有效记录起经过 30 秒（或配置值）后，会依次出现 `session_idle_timeout` 和 `session_closed`。
 
-- `connected`：客户端建立了连接。
-- `idle_timeout`：连续 30 秒未收到数据，服务正在主动关闭这条连接。
-- `disconnected`：客户端断开了连接。
+记录必须是完整 UTF-8 JSONL 行，且顶层 `deviceId` 为非空字符串。同一设备从不同 IP/端口或 TCP 重连提交记录时，在上述空闲窗口内会写入同一会话文件。无效 JSON、缺少/变更 `deviceId`、超长行和断开时未完成行只会写入 `record_rejected`，不会进入设备归档。
 
-列出原始数据文件：
-
-```bash
-find data/connections -maxdepth 1 -type f -name '*.bin' -ls
-```
-
-查看第一份数据的十六进制内容：
-
-```bash
-first_bin=$(find data/connections -maxdepth 1 -type f -name '*.bin' -print -quit)
-
-if [ -n "$first_bin" ]; then
-  od -Ax -tx1 -N 256 "$first_bin"
-fi
-```
-
-两种文件的区别：
-
-- `data/connections/*.bin`：设备传来的原始字节，是最重要、最可信的数据。
-- `data/events.jsonl`：方便观察连接时间、客户端 IP、每次收到多少字节等信息。
-
-当前程序不会猜测设备协议，也不会主动向设备回复业务 ACK。
-
-因空闲超时结束的连接会依次出现 `idle_timeout` 和 `disconnected`；客户端正常关闭时只会出现 `disconnected`。
-
-## 第十一步：配置 App
-
-在 App 中填写：
-
-```text
-网络协议：TCP
-IP/域名：8.134.210.73
-端口：30050
-回传频率：根据需要选择，例如 1 秒 1 次
-```
-
-点击“设置”后，在服务器实时观察：
-
-```bash
-docker compose logs -f collector
-```
-
-另开一个 SSH 窗口观察事件：
-
-```bash
-cd /opt/data_record_server
-tail -f data/events.jsonl
-```
-
-按 `Ctrl+C` 只是退出日志查看，不会停止接收程序。
-
-## 常用维护命令
-
-查看状态：
+## 日常维护与故障处理
 
 ```bash
 docker compose ps
-```
-
-查看最近日志：
-
-```bash
 docker compose logs --tail=100 collector
-```
-
-实时查看日志：
-
-```bash
-docker compose logs -f collector
-```
-
-重启程序：
-
-```bash
 docker compose restart collector
-```
-
-停止并删除容器：
-
-```bash
 docker compose down
 ```
 
-重新启动：
+`data/` 是 bind mount，重启、停止或重建容器不会删除 `data/devices/` 或 `events.jsonl`。请按保留策略备份这些文件并监控磁盘使用量；服务不自动清理历史数据。
 
-```bash
-docker compose up -d --build
-```
-
-`data/` 是服务器上的持久化目录，所以正常重启、`down` 或重新构建容器都不会删除已经采集的数据。
-
-最后提醒：当前服务没有 TLS 和客户端认证。测试阶段可以临时开放 `0.0.0.0/0:30050`，正式运行时应尽量限制安全组来源，并监控磁盘空间。另外，之前服务器 root 密码已经在聊天中明文出现，建议部署完成后更换密码并改用 SSH 密钥登录。
+若日志出现 `Permission denied`，执行 `docker compose down`，再以 Compose 使用的同一 UID/GID 运行 `scripts/prepare-data-dir.sh` 后重新启动。若客户端得到 `connection refused`，依次检查 `docker compose ps`、服务日志、`docker compose port` 及安全组/防火墙的来源 IP 和端口。

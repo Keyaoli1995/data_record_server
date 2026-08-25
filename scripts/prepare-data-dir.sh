@@ -6,6 +6,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 DATA_DIR=$PROJECT_ROOT/data
 CONNECTIONS_DIR=$DATA_DIR/connections
+DEVICES_DIR=$DATA_DIR/devices
 EVENTS_FILE=$DATA_DIR/events.jsonl
 COLLECTOR_UID=${COLLECTOR_UID:-10001}
 COLLECTOR_GID=${COLLECTOR_GID:-10001}
@@ -64,6 +65,22 @@ fi
 
 if [ -e "$CONNECTIONS_DIR" ] && [ ! -d "$CONNECTIONS_DIR" ]; then
   echo "Connections path is not a directory: $CONNECTIONS_DIR" >&2
+  exit 1
+fi
+
+if [ -L "$DEVICES_DIR" ]; then
+  echo "Refusing devices directory symlink: $DEVICES_DIR" >&2
+  exit 1
+fi
+
+if [ -e "$DEVICES_DIR" ] && [ ! -d "$DEVICES_DIR" ]; then
+  echo "Devices path is not a directory: $DEVICES_DIR" >&2
+  exit 1
+fi
+
+if [ -d "$DEVICES_DIR" ] \
+  && [ -n "$(find -P "$DEVICES_DIR" -mindepth 1 -maxdepth 1 -type l -name 'device-*' -print -quit)" ]; then
+  echo "Refusing device session directory symlink under: $DEVICES_DIR" >&2
   exit 1
 fi
 

@@ -2,101 +2,58 @@
 
 ## 服务用途
 
-本项目是一个长期运行的 TCP 原始数据接收服务。设备连接服务器后，服务按每一条 TCP 连接分别保存收到的原始字节，供后续协议解析使用。
-
-服务默认通过 Docker Compose 对外提供 `30050/TCP`，容器异常退出或服务器重启后会由 Docker 自动恢复（`restart: unless-stopped`）。
+本项目是长期运行的 TCP JSONL 接收服务。它只保存符合设备记录契约的完整 JSONL 行，并按顶层 `deviceId` 管理设备会话；不是按 TCP 连接保存任意字节流的服务。Docker Compose 默认发布 `30050/TCP`，并使用 `restart: unless-stopped` 恢复异常退出后的容器。
 
 ## 已具备的能力
 
-### 接收与原始数据留存
+### JSONL 验证与设备会话归档
 
-- 监听 IPv4 地址 `0.0.0.0`，可接收来自公网或局域网的 TCP 客户端。
-- 每建立一条 TCP 连接，就创建一个独立的 `data/connections/*.bin` 文件。
-- `.bin` 按接收顺序原样保存字节，不添加换行、分隔符、编码转换或协议解析；它是最可信的原始数据副本。
-- 每个连接都独立处理：一个设备断开或发生异常，不会停止其他设备的接收。
-- 默认每次最多从 socket 读取 `4096` 字节；这是读取块大小，不是单条业务报文的长度限制。
+- 接收 UTF-8 JSONL；一条记录必须以换行符结束、JSON 顶层值为对象，且 `deviceId` 是非空字符串。
+- `MAX_JSON_LINE_BYTES` 默认 `65536`，限制一条记录内容（不含换行符）的字节数。`READ_BUFFER_BYTES` 默认 `4096` 仅是读取块大小。
+- 每条 TCP 连接在第一个有效记录后绑定一个 `deviceId`；同连接不能切换设备身份。
+- 有效完整行不做重编码或 JSON 重排，原样写入权威归档 `data/devices/device-<URL-escaped-deviceId>/*.jsonl`。
+- 相同 `deviceId` 的不同 IP、端口和 TCP 重连会附着到同一个活跃设备会话，不会按连接拆分文件。
+- 会话从最后一条有效记录起默认 30 秒后关闭；关闭后同设备的下一条有效记录会开始新归档。
+- 无效 UTF-8/JSON、非对象、缺少或变更 `deviceId`、超长行和断开时未完成行均不进入归档，只产生 `record_rejected`。
 
-### 连接生命周期与空闲回收
+### 生命周期与诊断
 
-- 一个连接每收到一次数据，都会重新开始空闲计时。
-- 若该连接连续 `30` 秒没有收到任何数据，服务会主动关闭它，释放对应的 socket、处理线程和已打开的 `.bin` 文件。
-- 被关闭后的 `.bin` 文件仍保存在磁盘中，用于后续分析；文件本身不再占用线程或连接资源。
-- 空闲超时会记录 `idle_timeout`，随后记录 `disconnected`。正常关闭不会产生 `idle_timeout`。
-- 设备重新上线并再次建立 TCP 连接时，会新建一个 `.bin` 文件，不会追加到旧文件。
-
-### 事件日志与排障
-
-服务会维护 `data/events.jsonl`。这是 JSON Lines 文件：一行是一个独立 JSON 事件，方便使用 `tail`、Python 或日志工具分析。
-
-常见事件为：
+`data/events.jsonl` 是带全局锁的 JSON Lines 诊断日志；多线程写入时每行保持完整。事件包括：
 
 | 事件 | 主要字段 | 含义 |
 | --- | --- | --- |
-| `connected` | `time`、`file`、`client_ip`、`client_port` | 已接受客户端连接，并创建对应原始文件。 |
-| `idle_timeout` | `time`、`file`、`idle_timeout_seconds`、`total_bytes` | 连接连续静默达到超时时间。 |
-| `disconnected` | `time`、`file`、`total_bytes` | 连接已结束，原始文件已关闭。 |
-| `error` | `time`、`file`、`error_type`、`error` | 该连接处理过程中发生的异常。 |
+| `session_started` | `time`、`file`、`device_id` | 新设备会话文件已创建。 |
+| `session_attached` | `time`、`file`、`device_id`、`client_ip`、`client_port` | 一个客户端首次向活跃会话写入有效记录。 |
+| `record_rejected` | `time`、`client_ip`、`client_port`、`reason` | 无效记录被拒绝，未创建或写入归档。 |
+| `session_idle_timeout` | `time`、`file`、`device_id`、`idle_timeout_seconds`、`total_bytes` | 会话自最后有效记录起空闲到期。 |
+| `session_closed` | `time`、`file`、`device_id`、`total_bytes`、`reason` | 会话已关闭。 |
 
-`events.jsonl` 是诊断日志，不是原始数据的唯一副本；需要解析设备协议时，应以 `.bin` 文件为准。
+### 安全运行
 
-### 配置与安全运行
-
-- 可通过 `.env` 自定义监听端口、容器运行 UID/GID、读取块大小和空闲超时。
-- 数据目录以 bind mount 挂载到宿主机 `./data`；重建或升级容器不会删除已录制的数据。
-- 容器以非 root 用户运行、根文件系统只读、移除 Linux capabilities，并启用 `no-new-privileges`。
-- 支持 SIGTERM 等停止流程：停止接收新连接，并关闭当前活跃连接后再退出。
+- 数据通过 `./data:/data` bind mount 保留；升级或重建容器不会删除归档。
+- `scripts/prepare-data-dir.sh` 固定在项目目录下准备 `data/`，拒绝 `data/`、`data/devices/` 及其直接 `device-*` 会话目录的符号链接，并在需要时修复归档所有者；应在首次部署和 UID/GID 修改前运行。
+- 容器使用非 root 用户、只读根文件系统、`no-new-privileges` 和空 capability 集合。不要通过 root 身份绕开宿主机目录权限。
+- 服务不提供 TLS、客户端认证、速率限制、连接总数上限或自动保留清理；安全组和宿主机防火墙必须仅放行必要来源，运维方必须监控并备份数据。
 
 ## 并发模型与容量边界
 
-当前采用“**每个活跃 TCP 连接一个 Python 线程**”的并发模型。代码没有配置业务层面的 `MAX_CONNECTIONS`，因此不存在一个由程序固定写死的最大客户端数。
-
-实际可稳定承载的连接数取决于服务器资源，主要包括：
-
-- 可用文件描述符上限（每个活跃连接至少需要 TCP socket 和正在写入的 `.bin` 文件）；
-- 线程数、内存和容器/系统的 PID 限制；
-- 磁盘容量与写入 IOPS；
-- 设备数量、每台设备的上报频率和每次上报数据量。
-
-TCP 监听 socket 使用 Python 标准库的默认连接等待队列，默认约为 `5`。它表示“瞬时到达、尚未被服务线程接受的连接”可排队的数量，不表示服务只能同时连接 5 台设备。大量设备在同一瞬间同时拨号时，超过队列和系统处理速度的连接可能超时、被拒绝或需要客户端重连。
-
-对于持续回传数据的连接，线程会持续存在；对于完全静默的连接，默认 30 秒后会被回收。因此，这个实现适合几十台低频持续上报设备。若计划稳定接入上百台设备或存在高频大数据量上报，应先进行压力测试，并考虑增加显式连接上限、增大监听队列，以及改造事件日志的写入方式。
-
-## 多设备同时写入时的数据完整性
-
-每个连接写入自己的 `.bin` 文件，不会与其他连接混写。
-
-`events.jsonl` 使用全局互斥锁，确保多线程同时记录事件时每一行 JSON 都完整，不会相互穿插或损坏。因此，锁的目的不是丢弃数据，而是保证日志可读。
-
-服务不会为每次读取写入 `received` 事件或十六进制数据，因此设备持续上报时只增长各自的 `.bin` 文件，不会以相同频率竞争 `events.jsonl` 锁。共享日志只在连接、超时、错误和断开等低频事件发生时追加记录。
-
-因此，当前服务优先保证原始数据完整，同时避免高频上报造成大量重复诊断日志；它仍不是面向大规模高吞吐采集的容量承诺。
+每个活跃 TCP 连接使用一个 Python 线程。设备归档与事件日志分别在必要的锁保护下写入，以避免同一活跃设备会话的 JSONL 行交错。可承载数量受文件描述符、线程/内存、磁盘容量与 IOPS、上报频率和系统限制共同约束；尚未对大规模并发给出压测容量承诺。
 
 ## 当前不具备的能力
 
-- 不解析 TCP 业务协议、NMEA、JSON 或定位字段。
-- 不校验报文边界、校验和或设备身份。
-- 不向客户端发送自定义应用层 ACK、心跳或控制命令。
-- 不提供 Web 页面、数据库、检索接口或实时展示。
-- 不按文件大小、时间或设备 ID 自动切分/合并文件；文件边界仅由 TCP 连接边界决定。
-- 不限制单个客户端的总数据量，也不限制最大活跃客户端数。
-- 未对大规模并发连接给出经过压测验证的容量承诺。
+- 不接受未按此 JSONL 契约编码或没有完整 JSONL 行的数据作为归档。
+- 不接受没有非空顶层 `deviceId` 的记录，也不允许一条 TCP 连接切换设备 ID。
+- 不提供 Web 页面、数据库、检索接口、实时展示、TLS、客户端认证或应用层 ACK。
+- 不自动删除历史 `.jsonl`，不限制单设备总数据量或最大活跃客户端数。
 
 ## 运行状态检查
 
-在项目根目录执行：
-
 ```bash
-# 查看容器、监听端口和最近日志
 docker compose ps
 docker compose logs --tail=100 collector
-docker compose port collector 30050
-
-# 查看已保存的原始文件与最新事件
-find data/connections -maxdepth 1 -type f -name '*.bin' -printf '%TY-%Tm-%Td %TH:%TM:%TS %s %p\n'
+find data/devices -type f -name '*.jsonl' -printf '%TY-%Tm-%Td %TH:%TM:%TS %s %p\n'
 tail -n 50 data/events.jsonl
-
-# 查看容器进程可打开文件数上限
 docker compose exec collector sh -c 'ulimit -n; cat /proc/self/limits'
 ```
 
-完整部署和排障步骤请查看 [README.md](README.md) 与 [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)。
+完整步骤见 [README.md](README.md) 与 [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)。
