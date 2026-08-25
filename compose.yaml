@@ -12,10 +12,12 @@ services:
       READ_BUFFER_BYTES: ${READ_BUFFER_BYTES:-4096}
       IDLE_TIMEOUT_SECONDS: ${IDLE_TIMEOUT_SECONDS:-30}
       MAX_JSON_LINE_BYTES: ${MAX_JSON_LINE_BYTES:-65536}
+      RETENTION_DAYS: ${RETENTION_DAYS:-30}
     ports:
       - "${TCP_PORT:-30050}:${TCP_PORT:-30050}/tcp"
     volumes:
       - ./data:/data
+      - /etc/localtime:/etc/localtime:ro
     restart: unless-stopped
     init: true
     read_only: true

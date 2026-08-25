@@ -102,13 +102,16 @@ class DeploymentFilesTest(unittest.TestCase):
                 "READ_BUFFER_BYTES": "${READ_BUFFER_BYTES:-4096}",
                 "IDLE_TIMEOUT_SECONDS": "${IDLE_TIMEOUT_SECONDS:-30}",
                 "MAX_JSON_LINE_BYTES": "${MAX_JSON_LINE_BYTES:-65536}",
+                "RETENTION_DAYS": "${RETENTION_DAYS:-30}",
             },
             collector["environment"],
         )
         self.assertEqual(
             ["${TCP_PORT:-30050}:${TCP_PORT:-30050}/tcp"], collector["ports"]
         )
-        self.assertEqual(["./data:/data"], collector["volumes"])
+        self.assertEqual(
+            ["./data:/data", "/etc/localtime:/etc/localtime:ro"], collector["volumes"]
+        )
         self.assertEqual("unless-stopped", collector["restart"])
         self.assertTrue(collector["init"])
         self.assertTrue(collector["read_only"])

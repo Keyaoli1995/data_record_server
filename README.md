@@ -5,8 +5,9 @@
 ## 接收与归档契约
 
 - 只接受以换行符结束的**完整 JSONL 行**；每行必须是 UTF-8 JSON 对象，且顶层 `deviceId` 为非空字符串。
-- 同一条 TCP 连接中的后续有效记录必须保持相同 `deviceId`。格式错误、非对象、缺少/变更 `deviceId`、超长行或连接结束时未完成的行都不会写入设备归档，只在 `data/events.jsonl` 追加 `record_rejected` 诊断事件。
+- 同一条 TCP 连接中的后续有效记录必须保持相同 `deviceId`。格式错误、非对象、缺少/变更 `deviceId`、超长行或连接结束时未完成的行都不会写入设备 JSONL 归档。
 - 有效行以接收时的原始完整行（包括原有的 `\n` 或 `\r\n`）追加到权威归档：`data/devices/device-<URL-escaped-deviceId>/*.jsonl`。
+- 每条出现拒绝记录的 TCP 连接会创建一个 `data/connections/*.bin`；该连接中所有被拒绝的原始字节按接收顺序追加到同一个 `.bin`。`data/events.jsonl` 中的 `rejected_connection_started`、`record_rejected` 与 `rejected_connection_closed` 事件通过 `file` 字段关联该文件。
 - 归档按 `deviceId` 而不是 IP、端口或 TCP 连接划分。同一设备在不同 IP/端口或 TCP 重连后，只要仍处于活跃会话，就会继续写入同一个 `.jsonl` 文件。
 - 设备会话从最后一条有效记录起默认 30 秒空闲后关闭。该会话关闭后下一条有效记录会创建新的 `.jsonl` 文件；TCP 连接断开本身不会立即关闭设备会话。
 
@@ -24,6 +25,7 @@
 | `READ_BUFFER_BYTES` | `4096` | 单次 socket 读取块大小，不是 JSONL 行长度限制。 |
 | `IDLE_TIMEOUT_SECONDS` | `30` | 从最后一条有效记录开始计算的设备会话空闲秒数。 |
 | `MAX_JSON_LINE_BYTES` | `65536` | 单条 JSONL 内容（不含换行符）的最大字节数；超出时记录 `record_rejected` 并关闭该 TCP 连接。 |
+| `RETENTION_DAYS` | `30` | 非活跃设备 JSONL 归档和拒绝连接 `.bin` 的保留天数。 |
 | `COLLECTOR_UID` / `COLLECTOR_GID` | `10001` / `10001` | 容器非 root 运行身份与 bind mount 所有者。 |
 
 可选的 `.env`（不要提交）示例：
@@ -34,9 +36,10 @@ COLLECTOR_GID=1000
 TCP_PORT=30100
 IDLE_TIMEOUT_SECONDS=45
 MAX_JSON_LINE_BYTES=65536
+RETENTION_DAYS=30
 ```
 
-所有数值必须是正整数；`TCP_PORT` 还必须在 `1` 至 `65535` 之间。使用自定义 UID/GID 时，下面的目录准备命令必须传入同一组值。
+所有数值必须是正整数；`TCP_PORT` 还必须在 `1` 至 `65535` 之间。使用自定义 UID/GID 时，下面的目录准备命令必须传入同一组值。Compose 会将宿主机的 `/etc/localtime` 只读挂载到容器，因此每日清理按服务器本地时间判定。
 
 ## 本地测试
 
@@ -88,6 +91,9 @@ tail -n 50 data/events.jsonl
 # 列出所有权威 JSONL 归档
 find data/devices -type f -name '*.jsonl' -print
 
+# 列出拒绝连接的原始字节归档
+find data/connections -type f -name '*.bin' -print
+
 # 查看第一份归档的 JSONL 记录
 first_jsonl=$(find data/devices -type f -name '*.jsonl' -print -quit 2>/dev/null)
 if [ -n "$first_jsonl" ]; then
@@ -103,12 +109,17 @@ fi
 | --- | --- |
 | `session_started` | 为一个设备创建新的会话归档文件。 |
 | `session_attached` | 某个 IP/端口首次向该活跃设备会话提交有效记录。 |
-| `record_rejected` | 一条无效、未完成或超长记录被拒绝，未写入设备归档。 |
+| `rejected_connection_started` | 已为发生拒绝的 TCP 连接创建 `.bin`；`file` 指向该文件。 |
+| `record_rejected` | 一条无效、未完成或超长记录被拒绝，未写入设备 JSONL；`file` 指向所属连接 `.bin`。 |
+| `rejected_connection_closed` | 拒绝连接已关闭；`file` 指向该连接 `.bin`。 |
 | `session_idle_timeout` | 从最后一条有效记录起达到空闲超时。 |
 | `session_closed` | 会话文件已关闭；原因可能是空闲超时或服务停止。 |
+| `retention_cleanup` | 已执行归档清理；包含触发原因、删除文件数、回收字节数和失败数。 |
+
+服务启动后会立即执行一次清理，之后每天服务器本地时间跨越 `00:00` 时再执行一次。它只删除超过 `RETENTION_DAYS` 的非活跃 `data/devices/**/*.jsonl` 和 `data/connections/*.bin`，并会移除清空的设备目录；活跃文件及 `data/events.jsonl` 不会被删除。
 
 ## 备份与排障
 
-`data/` 是 bind mount，`docker compose restart`、`down` 或重建容器不会删除其中的数据。请按保留策略备份 `data/devices/` 与 `data/events.jsonl`，并监控磁盘容量；服务不会自动清理历史归档。
+`data/` 是 bind mount，`docker compose restart`、`down` 或重建容器不会删除其中的数据。请按需要备份 `data/devices/`、`data/connections/` 与 `data/events.jsonl`。保留清理不会删除事件日志，且拒绝连接的单个 `.bin` 没有大小上限；请持续监控磁盘容量。
 
 出现 `Permission denied` 时，先停止容器，以与 Compose 完全相同的 UID/GID 重新执行 `scripts/prepare-data-dir.sh`，再启动容器。出现 `connection refused` 时，检查 `docker compose ps`、`docker compose logs --tail=100 collector`、端口映射以及安全组/防火墙规则。
