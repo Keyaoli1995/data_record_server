@@ -189,6 +189,7 @@ class CollectorServerTest(unittest.TestCase):
         device_files = self._device_files()
         self.assertEqual(1, len(device_files))
         self.assertEqual(first_record + second_record, device_files[0].read_bytes())
+        self.assertEqual([], self._connection_files())
         self.assertEqual(
             ["session_started", "session_attached", "session_attached"],
             [event["event"] for event in self._session_events()],
@@ -236,21 +237,46 @@ class CollectorServerTest(unittest.TestCase):
         self.assertIn("_a%2Fb_", device_files[0].name)
         self.assertEqual({"a/b"}, {event["device_id"] for event in self._session_events()})
 
-    def test_rejects_invalid_json_and_missing_device_id_without_creating_data_files(self):
+    def test_records_rejected_bytes_in_one_connection_file_and_closes_at_eof(self):
+        first_record = b'{"deviceId":"D1","sequence":1}\n'
+        first_rejection = b'{"deviceId":\n'
+        second_rejection = b'not-json\n'
+        second_record = b'{"deviceId":"D1","sequence":2}\n'
         with socket.create_connection(self._server.server_address, timeout=2) as client:
-            client.sendall(b'not json\n{"sequence":2}\n')
+            client.sendall(
+                first_record + first_rejection + second_rejection + second_record
+            )
             client.shutdown(socket.SHUT_WR)
             self.assertEqual(b"", client.recv(1))
 
         self._wait_for(
             lambda: [event["reason"] for event in self._rejection_events()]
-            == ["invalid_json", "missing_device_id"]
+            == ["invalid_json", "invalid_json"]
         )
 
-        self.assertEqual([], self._device_files())
+        self.assertEqual([first_record + second_record], [
+            path.read_bytes() for path in self._device_files()
+        ])
+        connection_files = sorted((self._data_dir / "connections").glob("*.bin"))
+        self.assertEqual(1, len(connection_files))
         self.assertEqual(
-            ["invalid_json", "missing_device_id"],
-            [event["reason"] for event in self._rejection_events()],
+            first_rejection + second_rejection, connection_files[0].read_bytes()
+        )
+        rejection_events = self._rejection_events()
+        self.assertEqual(
+            [event["file"] for event in rejection_events],
+            [connection_files[0].relative_to(self._data_dir).as_posix()] * 2,
+        )
+        self._wait_for(
+            lambda: any(
+                event["event"] == "rejected_connection_closed"
+                and event["reason"] == "eof"
+                for event in self._read_events()
+            )
+        )
+        self.assertEqual(
+            ["invalid_json", "invalid_json"],
+            [event["reason"] for event in rejection_events],
         )
 
     def test_rejects_an_incomplete_record_at_end_of_stream(self):
@@ -266,11 +292,34 @@ class CollectorServerTest(unittest.TestCase):
 
         self.assertEqual([], self._device_files())
 
+    def test_rejections_from_feed_and_finish_share_one_connection_file(self):
+        rejected_record = b"not-json\n"
+        incomplete_record = b'{"deviceId":"D1"'
+        with socket.create_connection(self._server.server_address, timeout=2) as client:
+            client.sendall(rejected_record + incomplete_record)
+            client.shutdown(socket.SHUT_WR)
+            self.assertEqual(b"", client.recv(1))
+
+        self._wait_for(
+            lambda: [event["reason"] for event in self._rejection_events()]
+            == ["invalid_json", "incomplete_line"]
+        )
+        connection_files = self._connection_files()
+        self.assertEqual(1, len(connection_files))
+        self.assertEqual(
+            rejected_record + incomplete_record, connection_files[0].read_bytes()
+        )
+        self.assertEqual(
+            1,
+            len({event["file"] for event in self._rejection_events()}),
+        )
+
     def test_rejects_an_incomplete_record_when_socket_times_out(self):
+        incomplete_record = b'{"deviceId":"D1"'
         server, server_thread = self._create_server_with_idle_timeout(0.15)
         try:
             with socket.create_connection(server.server_address, timeout=2) as client:
-                client.sendall(b'{"deviceId":"D1"')
+                client.sendall(incomplete_record)
                 self._wait_for(
                     lambda: [event["reason"] for event in self._rejection_events()]
                     == ["incomplete_line"]
@@ -280,6 +329,54 @@ class CollectorServerTest(unittest.TestCase):
 
             self.assertEqual([], self._device_files())
             self.assertEqual([], self._session_events())
+            connection_files = self._connection_files()
+            self.assertEqual(1, len(connection_files))
+            self.assertEqual(incomplete_record, connection_files[0].read_bytes())
+            self._wait_for(
+                lambda: any(
+                    event["event"] == "rejected_connection_closed"
+                    and event["reason"] == "socket_timeout"
+                    for event in self._read_events()
+                )
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+            self.assertFalse(server_thread.is_alive())
+
+    def test_closes_a_too_long_rejected_connection_with_parser_reason(self):
+        rejected_line = b"abcdef"
+        server = create_server(
+            Config(
+                host="127.0.0.1",
+                port=0,
+                data_dir=self._data_dir,
+                read_buffer_bytes=4,
+                max_json_line_bytes=5,
+            )
+        )
+        server_thread = threading.Thread(target=server.serve_forever)
+        server_thread.start()
+        try:
+            with socket.create_connection(server.server_address, timeout=2) as client:
+                client.sendall(rejected_line)
+                client.settimeout(2)
+                self.assertEqual(b"", client.recv(1))
+
+            self._wait_for(
+                lambda: any(
+                    event["event"] == "rejected_connection_closed"
+                    and event["reason"] == "line_too_long"
+                    for event in self._read_events()
+                )
+            )
+            connection_files = self._connection_files()
+            self.assertEqual(1, len(connection_files))
+            self.assertEqual(rejected_line, connection_files[0].read_bytes())
+            self.assertEqual(["line_too_long"], [
+                event["reason"] for event in self._rejection_events()
+            ])
         finally:
             server.shutdown()
             server.server_close()
@@ -340,6 +437,27 @@ class CollectorServerTest(unittest.TestCase):
             ["session_started", "session_attached", "session_closed"],
             [event["event"] for event in self._session_events()],
         )
+
+    def test_shutdown_closes_an_active_rejected_connection_with_shutdown_reason(self):
+        rejected_line = b"not-json\n"
+        with socket.create_connection(self._server.server_address, timeout=2) as client:
+            client.sendall(rejected_line)
+            self._wait_for(lambda: len(self._connection_files()) == 1)
+
+            self._server.shutdown()
+            client.settimeout(2)
+            self.assertEqual(b"", client.recv(1))
+
+        self._wait_for(
+            lambda: any(
+                event["event"] == "rejected_connection_closed"
+                and event["reason"] == "server_shutdown"
+                for event in self._read_events()
+            )
+        )
+        connection_files = self._connection_files()
+        self.assertEqual(1, len(connection_files))
+        self.assertEqual(rejected_line, connection_files[0].read_bytes())
 
     def test_serve_loop_failure_closes_active_connections_before_propagating(self):
         serve_error = RuntimeError("serve loop failed")
@@ -1025,6 +1143,9 @@ with tempfile.TemporaryDirectory() as directory:
 
     def _device_files(self):
         return sorted((self._data_dir / "devices").glob("**/*.jsonl"))
+
+    def _connection_files(self):
+        return sorted((self._data_dir / "connections").glob("*.bin"))
 
     def _session_events(self):
         return [

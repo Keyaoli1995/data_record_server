@@ -26,35 +26,56 @@ class CollectorRequestHandler(socketserver.BaseRequestHandler):
 
     def handle(self) -> None:
         parser = JsonlStreamParser(self.server.max_json_line_bytes)
+        rejected_recorder = None
+        close_reason = "handler_error"
         try:
             self.request.settimeout(self.server.idle_timeout_seconds)
             while True:
                 data = self.request.recv(self.server.read_buffer_bytes)
                 if not data:
-                    self._finish_stream(parser)
+                    rejected_recorder = self._finish_stream(parser, rejected_recorder)
+                    close_reason = "eof"
                     break
                 result = parser.feed(data)
-                self._store_feed_result(result)
+                rejected_recorder = self._store_feed_result(result, rejected_recorder)
                 if result.close_connection:
+                    close_reason = "line_too_long"
                     return
         except socket.timeout:
-            self._finish_stream(parser)
+            rejected_recorder = self._finish_stream(parser, rejected_recorder)
+            close_reason = "socket_timeout"
             return
         except Exception:
             LOGGER.exception(
                 "Failed while recording client connection from %s", self.client_address
             )
+        finally:
+            if rejected_recorder is not None:
+                if self.server.is_request_shutting_down(self.request):
+                    close_reason = "server_shutdown"
+                try:
+                    rejected_recorder.close(close_reason)
+                except Exception:
+                    LOGGER.exception(
+                        "Failed while closing rejected client connection from %s",
+                        self.client_address,
+                    )
 
-    def _store_feed_result(self, result) -> None:
+    def _store_feed_result(self, result, rejected_recorder):
         for record in result.records:
             self.server.storage.append_record(
                 self.client_address, record.device_id, record.raw_line
             )
         for rejection in result.rejections:
-            self.server.storage.record_rejected(self.client_address, rejection.reason)
+            if rejected_recorder is None:
+                rejected_recorder = self.server.storage.open_rejected_connection(
+                    self.client_address
+                )
+            rejected_recorder.record_rejected(rejection.reason, rejection.raw_bytes)
+        return rejected_recorder
 
-    def _finish_stream(self, parser: JsonlStreamParser) -> None:
-        self._store_feed_result(parser.finish())
+    def _finish_stream(self, parser: JsonlStreamParser, rejected_recorder):
+        return self._store_feed_result(parser.finish(), rejected_recorder)
 
 
 class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -76,6 +97,7 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.idle_timeout_seconds = idle_timeout_seconds
         self.max_json_line_bytes = max_json_line_bytes
         self._active_requests = set()
+        self._shutdown_requests = set()
         self._active_requests_condition = threading.Condition()
         self._sessions_close_lock = threading.Lock()
         self._sessions_closed = False
@@ -114,7 +136,13 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         finally:
             with self._active_requests_condition:
                 self._active_requests.discard(request)
+                self._shutdown_requests.discard(request)
                 self._active_requests_condition.notify_all()
+
+    def is_request_shutting_down(self, request) -> bool:
+        """Return whether server shutdown initiated closure of a client request."""
+        with self._active_requests_condition:
+            return request in self._shutdown_requests
 
     def shutdown(self) -> None:
         """Stop accepting clients and finish cleanup for active connections."""
@@ -145,6 +173,7 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     def _close_active_requests_and_wait(self) -> None:
         with self._active_requests_condition:
             active_requests = tuple(self._active_requests)
+            self._shutdown_requests.update(active_requests)
 
         for request in active_requests:
             try:
