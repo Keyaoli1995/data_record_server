@@ -1,6 +1,7 @@
 """Device-scoped JSONL record persistence and lifecycle events."""
 
 import json
+import stat
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -369,6 +370,56 @@ class Storage:
         if first_error is not None:
             raise first_error
 
+    def cleanup_expired_files(
+        self, retention_days: int, now: datetime, trigger: str
+    ) -> None:
+        """Remove inactive archive files older than the retention period."""
+        cutoff = now.timestamp() - retention_days * 86400
+        with self._sessions_lock:
+            active_session_paths = {
+                session.relative_path for session in self._sessions.values()
+            }
+        with self._rejected_paths_lock:
+            active_paths = active_session_paths | set(self._active_rejected_paths)
+
+        deleted_files = 0
+        reclaimed_bytes = 0
+        failed_files = 0
+        for path in self._expired_archive_paths():
+            relative_path = path.relative_to(self._data_dir).as_posix()
+            if relative_path in active_paths:
+                continue
+            try:
+                file_status = path.lstat()
+                if not stat.S_ISREG(file_status.st_mode):
+                    continue
+                if file_status.st_mtime >= cutoff:
+                    continue
+                path.unlink()
+            except OSError:
+                failed_files += 1
+                continue
+            deleted_files += 1
+            reclaimed_bytes += file_status.st_size
+
+        for directory in self._data_dir.joinpath("devices").glob("device-*"):
+            try:
+                if stat.S_ISDIR(directory.lstat().st_mode):
+                    directory.rmdir()
+            except OSError:
+                pass
+
+        self._events.write(
+            {
+                "event": "retention_cleanup",
+                "time": format_time(now),
+                "trigger": trigger,
+                "deleted_files": deleted_files,
+                "reclaimed_bytes": reclaimed_bytes,
+                "failed_files": failed_files,
+            }
+        )
+
     def _create_session(self, device_id: str) -> DeviceSession:
         escaped_device_id = quote_from_bytes(
             device_id.encode("utf-8", "surrogatepass"), safe=""
@@ -417,3 +468,8 @@ class Storage:
         """Remove a closed diagnostic file from the cleanup exclusion set."""
         with self._rejected_paths_lock:
             self._active_rejected_paths.discard(relative_path)
+
+    def _expired_archive_paths(self):
+        yield from self._data_dir.joinpath("connections").glob("*.bin")
+        for directory in self._data_dir.joinpath("devices").glob("device-*"):
+            yield from directory.glob("*.jsonl")

@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -22,6 +23,16 @@ from data_record_server.server import (
     create_shutdown_handler,
 )
 from data_record_server.storage import Storage
+
+
+class MutableLocalClock:
+    def __init__(self, value):
+        self.value = value
+        self.history = []
+
+    def __call__(self):
+        self.history.append(self.value)
+        return self.value
 
 
 class CollectorServerTest(unittest.TestCase):
@@ -54,6 +65,44 @@ class CollectorServerTest(unittest.TestCase):
         )
         try:
             self.assertEqual("127.0.0.1", server.server_address[0])
+        finally:
+            server.server_close()
+
+    def test_service_actions_cleans_on_startup_and_once_per_local_date_change(self):
+        local_clock = MutableLocalClock(
+            datetime(2026, 8, 10, 23, 59, tzinfo=timezone(timedelta(hours=8)))
+        )
+        storage = mock.Mock(spec=Storage)
+        server = CollectorServer(
+            server_address=("127.0.0.1", 0),
+            storage=storage,
+            read_buffer_bytes=4,
+            retention_days=14,
+            local_clock=local_clock,
+        )
+        try:
+            server.service_actions()
+            server.service_actions()
+            local_clock.value += timedelta(minutes=2)
+            server.service_actions()
+        finally:
+            server.server_close()
+
+        self.assertEqual(
+            [
+                mock.call(14, local_clock.history[0], "startup"),
+                mock.call(14, local_clock.history[2], "midnight"),
+            ],
+            storage.cleanup_expired_files.call_args_list,
+        )
+        self.assertEqual(3, storage.expire_sessions.call_count)
+
+    def test_create_server_uses_configured_retention_days(self):
+        server = create_server(
+            Config("127.0.0.1", 0, self._data_dir, 4, retention_days=14)
+        )
+        try:
+            self.assertEqual(14, server.retention_days)
         finally:
             server.server_close()
 
@@ -310,7 +359,7 @@ class CollectorServerTest(unittest.TestCase):
             self.assertTrue(recorder._stream.closed)
             self.assertNotIn(recorder.relative_path, storage._active_rejected_paths)
             self.assertEqual(
-                ["rejected_connection_started"],
+                ["retention_cleanup", "rejected_connection_started"],
                 [event["event"] for event in self._read_events()],
             )
             log_exception.assert_called_once()

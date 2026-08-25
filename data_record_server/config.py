@@ -15,6 +15,7 @@ class Config:
     read_buffer_bytes: int
     idle_timeout_seconds: int = 30
     max_json_line_bytes: int = MAX_JSON_LINE_BYTES
+    retention_days: int = 30
 
     @classmethod
     def from_environ(
@@ -32,6 +33,9 @@ class Config:
             environment.get("MAX_JSON_LINE_BYTES", str(MAX_JSON_LINE_BYTES)),
             "MAX_JSON_LINE_BYTES",
         )
+        retention_days = _parse_integer(
+            environment.get("RETENTION_DAYS", "30"), "RETENTION_DAYS"
+        )
 
         if not 1 <= port <= 65535:
             raise ValueError("TCP_PORT must be between 1 and 65535")
@@ -41,6 +45,8 @@ class Config:
             raise ValueError("IDLE_TIMEOUT_SECONDS must be positive")
         if max_json_line_bytes <= 0:
             raise ValueError("MAX_JSON_LINE_BYTES must be positive")
+        if retention_days <= 0:
+            raise ValueError("RETENTION_DAYS must be positive")
 
         return cls(
             host=environment.get("TCP_HOST", "0.0.0.0"),
@@ -49,6 +55,7 @@ class Config:
             read_buffer_bytes=read_buffer_bytes,
             idle_timeout_seconds=idle_timeout_seconds,
             max_json_line_bytes=max_json_line_bytes,
+            retention_days=retention_days,
         )
 
 

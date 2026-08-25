@@ -1,6 +1,7 @@
 """Contracts for device-scoped JSONL recording sessions."""
 
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -25,6 +26,86 @@ class MutableUtcClock:
 
 
 class StorageTest(unittest.TestCase):
+    def test_cleanup_removes_expired_archives_and_empty_device_directories(self):
+        now = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            stale_connection = data_dir / "connections" / "stale.bin"
+            fresh_connection = data_dir / "connections" / "fresh.bin"
+            stale_device_file = data_dir / "devices" / "device-D1" / "stale.jsonl"
+            for path, contents, age_days in (
+                (stale_connection, b"old", 31),
+                (fresh_connection, b"new", 1),
+                (stale_device_file, b"archive", 31),
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(contents)
+                timestamp = (now - timedelta(days=age_days)).timestamp()
+                os.utime(path, (timestamp, timestamp))
+
+            storage = Storage(data_dir)
+            storage.cleanup_expired_files(30, now, "startup")
+            events = self._read_events(data_dir)
+
+            self.assertFalse(stale_connection.exists())
+            self.assertTrue(fresh_connection.exists())
+            self.assertFalse(stale_device_file.exists())
+            self.assertFalse((data_dir / "devices" / "device-D1").exists())
+
+        self.assertEqual(
+            {
+                "event": "retention_cleanup",
+                "time": "2026-08-10T12:00:00Z",
+                "trigger": "startup",
+                "deleted_files": 2,
+                "reclaimed_bytes": 10,
+                "failed_files": 0,
+            },
+            events[-1],
+        )
+
+    def test_cleanup_skips_active_archives_and_symbolic_links(self):
+        now = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            storage = Storage(data_dir, clock=lambda: now)
+            session = storage.append_record(
+                ("203.0.113.1", 5001), "D1", b'{"deviceId":"D1"}\n'
+            )
+            rejected = storage.open_rejected_connection(("203.0.113.2", 5002))
+            symlink_target = data_dir / "outside.bin"
+            symlink_target.write_bytes(b"outside")
+            symlink = data_dir / "connections" / "expired-link.bin"
+            symlink.symlink_to(symlink_target)
+            stale_timestamp = (now - timedelta(days=31)).timestamp()
+            for path in (
+                data_dir / session.relative_path,
+                data_dir / rejected.relative_path,
+                symlink_target,
+            ):
+                os.utime(path, (stale_timestamp, stale_timestamp))
+            os.utime(
+                symlink,
+                (stale_timestamp, stale_timestamp),
+                follow_symlinks=False,
+            )
+
+            storage.cleanup_expired_files(30, now, "startup")
+            cleanup_event = self._read_events(data_dir)[-1]
+            rejected.close("eof")
+            storage.close_all_sessions()
+
+            self.assertTrue((data_dir / session.relative_path).exists())
+            self.assertTrue((data_dir / rejected.relative_path).exists())
+            self.assertTrue(symlink.is_symlink())
+            self.assertTrue(symlink_target.exists())
+
+        self.assertEqual(0, cleanup_event["deleted_files"])
+        self.assertEqual(0, cleanup_event["reclaimed_bytes"])
+        self.assertEqual(0, cleanup_event["failed_files"])
+
     def test_merges_device_records_from_multiple_clients_into_one_jsonl_session(self):
         clock = MutableUtcClock(datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc))
         first_line = b'{"deviceId":"D1"}\n'
