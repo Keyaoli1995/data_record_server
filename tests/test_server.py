@@ -169,170 +169,146 @@ class CollectorServerTest(unittest.TestCase):
         finally:
             self._close_file_descriptors(captured_file_descriptors)
 
-    def test_records_complete_stream_without_per_read_events(self):
+    def test_appends_records_from_two_connections_to_one_device_session(self):
+        first_record = b'{"deviceId":"D1","sequence":1}\n'
+        second_record = b'{"deviceId":"D1","sequence":2}\n'
+
+        for record in (first_record, second_record):
+            with socket.create_connection(
+                self._server.server_address, timeout=2
+            ) as client:
+                client.sendall(record)
+                client.shutdown(socket.SHUT_WR)
+                self.assertEqual(b"", client.recv(1))
+
+        self._wait_for(
+            lambda: len(self._device_files()) == 1
+            and self._device_files()[0].read_bytes() == first_record + second_record
+        )
+
+        device_files = self._device_files()
+        self.assertEqual(1, len(device_files))
+        self.assertEqual(first_record + second_record, device_files[0].read_bytes())
+        self.assertEqual(
+            ["session_started", "session_attached", "session_attached"],
+            [event["event"] for event in self._session_events()],
+        )
+
+    def test_writes_different_device_ids_to_separate_sessions(self):
+        records = {
+            "D1": b'{"deviceId":"D1","sequence":1}\n',
+            "D2": b'{"deviceId":"D2","sequence":2}\n',
+        }
+
+        for record in records.values():
+            with socket.create_connection(
+                self._server.server_address, timeout=2
+            ) as client:
+                try:
+                    client.sendall(record)
+                except OSError:
+                    pass
+
+        self._wait_for(lambda: len(self._device_files()) == 2)
+
+        self.assertEqual(set(records.values()), {path.read_bytes() for path in self._device_files()})
+        self.assertEqual(
+            {"D1", "D2"},
+            {
+                event["device_id"]
+                for event in self._session_events()
+                if event["event"] == "session_started"
+            },
+        )
+
+    def test_rejects_invalid_json_and_missing_device_id_without_creating_data_files(self):
         with socket.create_connection(self._server.server_address, timeout=2) as client:
-            client.sendall(b"abcdef")
+            client.sendall(b'not json\n{"sequence":2}\n')
             client.shutdown(socket.SHUT_WR)
             self.assertEqual(b"", client.recv(1))
 
-        self._wait_for(lambda: self._disconnected_count() == 1)
-
-        connection_files = list((self._data_dir / "connections").glob("*.bin"))
-        self.assertEqual(1, len(connection_files))
-        self.assertEqual(b"abcdef", connection_files[0].read_bytes())
-
-        events = self._read_events()
-        self.assertEqual(
-            ["connected", "disconnected"],
-            [event["event"] for event in events],
+        self._wait_for(
+            lambda: [event["reason"] for event in self._rejection_events()]
+            == ["invalid_json", "missing_device_id"]
         )
-        self.assertEqual("127.0.0.1", events[0]["client_ip"])
-        self.assertIsInstance(events[0]["client_port"], int)
-        self.assertEqual(6, events[-1]["total_bytes"])
 
-    def test_closes_a_silent_connection_after_its_idle_timeout(self):
+        self.assertEqual([], self._device_files())
+        self.assertEqual(
+            ["invalid_json", "missing_device_id"],
+            [event["reason"] for event in self._rejection_events()],
+        )
+
+    def test_rejects_an_incomplete_record_at_end_of_stream(self):
+        with socket.create_connection(self._server.server_address, timeout=2) as client:
+            client.sendall(b'{"deviceId":"D1"')
+            client.shutdown(socket.SHUT_WR)
+            self.assertEqual(b"", client.recv(1))
+
+        self._wait_for(
+            lambda: [event["reason"] for event in self._rejection_events()]
+            == ["incomplete_line"]
+        )
+
+        self.assertEqual([], self._device_files())
+
+    def test_expires_a_device_session_after_its_idle_timeout(self):
         server, server_thread = self._create_server_with_idle_timeout(0.15)
         try:
             with socket.create_connection(server.server_address, timeout=2) as client:
-                client.sendall(b"abc")
-                client.settimeout(2)
-                self.assertEqual(b"", client.recv(1))
-
-            self._wait_for(
-                lambda: any(
-                    event["event"] == "disconnected" for event in self._read_events()
-                )
-            )
-            events = self._read_events()
-            self.assertEqual(
-                ["connected", "idle_timeout", "disconnected"],
-                [event["event"] for event in events],
-            )
-            self.assertEqual(0.15, events[1]["idle_timeout_seconds"])
-            self.assertEqual(3, events[1]["total_bytes"])
-            self.assertEqual(b"abc", (self._data_dir / events[0]["file"]).read_bytes())
-            self.assertNotIn("error", [event["event"] for event in events])
-        finally:
-            server.shutdown()
-            server.server_close()
-            server_thread.join(timeout=2)
-            self.assertFalse(server_thread.is_alive())
-
-    def test_received_data_resets_the_idle_timeout(self):
-        server, server_thread = self._create_server_with_idle_timeout(0.15)
-        try:
-            with socket.create_connection(server.server_address, timeout=2) as client:
-                client.sendall(b"a")
-                time.sleep(0.05)
-                client.sendall(b"b")
-                time.sleep(0.05)
-                client.sendall(b"c")
+                client.sendall(b'{"deviceId":"D1"}\n')
                 client.shutdown(socket.SHUT_WR)
-                client.settimeout(2)
                 self.assertEqual(b"", client.recv(1))
 
             self._wait_for(
                 lambda: any(
-                    event["event"] == "disconnected" for event in self._read_events()
+                    event["event"] == "session_closed"
+                    for event in self._read_events()
                 )
             )
-            events = self._read_events()
+            events = self._session_events()
             self.assertEqual(
-                ["connected", "disconnected"],
+                [
+                    "session_started",
+                    "session_attached",
+                    "session_idle_timeout",
+                    "session_closed",
+                ],
                 [event["event"] for event in events],
             )
-            self.assertNotIn("idle_timeout", [event["event"] for event in events])
+            self.assertEqual(0.15, events[2]["idle_timeout_seconds"])
+            self.assertEqual(len(b'{"deviceId":"D1"}\n'), events[2]["total_bytes"])
+            self.assertEqual("idle_timeout", events[3]["reason"])
         finally:
             server.shutdown()
             server.server_close()
             server_thread.join(timeout=2)
             self.assertFalse(server_thread.is_alive())
 
-    def test_accepts_a_second_client_while_the_first_remains_connected(self):
-        with socket.create_connection(
-            self._server.server_address, timeout=2
-        ) as first_client:
-            first_client.sendall(b"first")
-            self._wait_for(lambda: self._contains_payload(self._data_dir, b"first"))
+    def test_shutdown_closes_an_active_device_session(self):
+        record = b'{"deviceId":"D1"}\n'
+        with socket.create_connection(self._server.server_address, timeout=2) as client:
+            client.sendall(record)
+            self._wait_for(lambda: self._contains_payload(self._data_dir, record))
 
-            with socket.create_connection(
-                self._server.server_address, timeout=2
-            ) as second_client:
-                second_client.sendall(b"second")
-                second_client.shutdown(socket.SHUT_WR)
-                self.assertEqual(b"", second_client.recv(1))
+            self._server.shutdown()
+            client.settimeout(2)
+            self.assertEqual(b"", client.recv(1))
 
-            self._wait_for(lambda: self._disconnected_count() == 1)
-            completed_file = next(
-                event["file"]
-                for event in self._read_events()
-                if event["event"] == "disconnected"
+        self._wait_for(
+            lambda: any(
+                event["event"] == "session_closed"
+                and event["reason"] == "server_shutdown"
+                for event in self._session_events()
             )
-            self.assertEqual(b"second", (self._data_dir / completed_file).read_bytes())
-
-        self._wait_for(lambda: self._disconnected_count() == 2)
-        connection_files = list((self._data_dir / "connections").glob("*.bin"))
-        self.assertEqual(2, len(connection_files))
-        self.assertEqual(
-            {b"first", b"second"}, {path.read_bytes() for path in connection_files}
         )
-        events_by_file = {}
-        for event in self._read_events():
-            events_by_file.setdefault(event["file"], []).append(event)
-        for relative_path, events in events_by_file.items():
-            payload = (self._data_dir / relative_path).read_bytes()
-            self.assertEqual("connected", events[0]["event"])
-            self.assertEqual("disconnected", events[-1]["event"])
-            self.assertEqual(2, len(events))
-            self.assertEqual(len(payload), events[-1]["total_bytes"])
-
-    def test_sigterm_closes_an_active_connection_before_process_exit(self):
-        with tempfile.TemporaryDirectory() as directory:
-            data_dir = Path(directory)
-            port = self._find_free_tcp_port()
-            environment = os.environ.copy()
-            environment.update(
-                {
-                    "TCP_HOST": "127.0.0.1",
-                    "TCP_PORT": str(port),
-                    "DATA_DIR": str(data_dir),
-                    "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
-                }
-            )
-            process = subprocess.Popen(
-                [sys.executable, "-m", "data_record_server"],
-                cwd=Path(__file__).resolve().parents[1],
-                env=environment,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            client = None
-            try:
-                client = self._connect_to_process(port, process)
-                client.sendall(b"abc")
-                self._wait_for(lambda: self._contains_payload(data_dir, b"abc"))
-
-                process.send_signal(signal.SIGTERM)
-                process.wait(timeout=2)
-                self.assertEqual(0, process.returncode)
-
-                events = self._read_events_from(data_dir)
-                self.assertEqual(
-                    ["connected", "disconnected"],
-                    [event["event"] for event in events],
-                )
-                self.assertEqual(3, events[-1]["total_bytes"])
-            finally:
-                if client is not None:
-                    client.close()
-                if process.poll() is None:
-                    process.kill()
-                    process.wait(timeout=2)
-                process.stderr.close()
+        self.assertEqual(
+            ["session_started", "session_attached", "session_closed"],
+            [event["event"] for event in self._session_events()],
+        )
 
     def test_serve_loop_failure_closes_active_connections_before_propagating(self):
         serve_error = RuntimeError("serve loop failed")
+        record = b'{"deviceId":"D1"}\n'
         failure_requested = threading.Event()
         client_recorded = threading.Event()
         client_finished = threading.Event()
@@ -349,10 +325,10 @@ class CollectorServerTest(unittest.TestCase):
         def run_client():
             try:
                 with socket.create_connection(server.server_address, timeout=2) as client:
-                    client.sendall(b"abc")
+                    client.sendall(record)
                     deadline = time.monotonic() + 2
                     while time.monotonic() < deadline:
-                        if self._contains_payload(self._data_dir, b"abc"):
+                        if self._contains_payload(self._data_dir, record):
                             failure_requested.set()
                             client_recorded.set()
                             break
@@ -389,8 +365,8 @@ class CollectorServerTest(unittest.TestCase):
                 self.fail(f"client thread failed before recording bytes: {client_result!r}")
             self._wait_for(
                 lambda: any(
-                    event["event"] == "disconnected"
-                    and event["total_bytes"] == 3
+                    event["event"] == "session_closed"
+                    and event["reason"] == "server_shutdown"
                     for event in self._read_events()
                 )
             )
@@ -939,13 +915,19 @@ with tempfile.TemporaryDirectory() as directory:
         return self._read_events_from(self._data_dir)
 
     def _create_server_with_idle_timeout(self, idle_timeout_seconds):
-        server = CollectorServer(
-            server_address=("127.0.0.1", 0),
-            storage=Storage(self._data_dir),
-            read_buffer_bytes=4,
-            idle_timeout_seconds=idle_timeout_seconds,
+        server = create_server(
+            Config(
+                host="127.0.0.1",
+                port=0,
+                data_dir=self._data_dir,
+                read_buffer_bytes=4,
+                idle_timeout_seconds=idle_timeout_seconds,
+            )
         )
-        thread = threading.Thread(target=server.serve_forever)
+        thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": 0.01},
+        )
         thread.start()
         return server, thread
 
@@ -963,11 +945,6 @@ with tempfile.TemporaryDirectory() as directory:
             except OSError as error:
                 if error.errno != errno.EBADF:
                     raise
-
-    def _disconnected_count(self):
-        return sum(
-            event["event"] == "disconnected" for event in self._read_events()
-        )
 
     def _assert_child_exits_successfully(self, child_code):
         environment = os.environ.copy()
@@ -995,23 +972,6 @@ with tempfile.TemporaryDirectory() as directory:
             process.stderr.close()
 
     @staticmethod
-    def _find_free_tcp_port():
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            probe.bind(("127.0.0.1", 0))
-            return probe.getsockname()[1]
-
-    def _connect_to_process(self, port, process):
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            if process.poll() is not None:
-                self.fail(f"collector process exited with {process.returncode}")
-            try:
-                return socket.create_connection(("127.0.0.1", port), timeout=0.2)
-            except OSError:
-                time.sleep(0.01)
-        self.fail("collector process did not accept a connection before the deadline")
-
-    @staticmethod
     def _read_events_from(data_dir):
         events_path = data_dir / "events.jsonl"
         if not events_path.exists():
@@ -1025,8 +985,25 @@ with tempfile.TemporaryDirectory() as directory:
     def _contains_payload(data_dir, expected_payload):
         return any(
             path.read_bytes() == expected_payload
-            for path in (data_dir / "connections").glob("*.bin")
+            for path in (data_dir / "devices").glob("**/*.jsonl")
         )
+
+    def _device_files(self):
+        return sorted((self._data_dir / "devices").glob("**/*.jsonl"))
+
+    def _session_events(self):
+        return [
+            event
+            for event in self._read_events()
+            if event["event"].startswith("session_")
+        ]
+
+    def _rejection_events(self):
+        return [
+            event
+            for event in self._read_events()
+            if event["event"] == "record_rejected"
+        ]
 
     def _wait_for(self, predicate):
         deadline = time.monotonic() + 2
