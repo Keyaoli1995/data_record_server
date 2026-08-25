@@ -472,4 +472,8 @@ class Storage:
     def _expired_archive_paths(self):
         yield from self._data_dir.joinpath("connections").glob("*.bin")
         for directory in self._data_dir.joinpath("devices").glob("device-*"):
-            yield from directory.glob("*.jsonl")
+            try:
+                if stat.S_ISDIR(directory.lstat().st_mode):
+                    yield from directory.glob("*.jsonl")
+            except OSError:
+                continue

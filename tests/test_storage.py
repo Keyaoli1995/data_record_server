@@ -106,6 +106,30 @@ class StorageTest(unittest.TestCase):
         self.assertEqual(0, cleanup_event["reclaimed_bytes"])
         self.assertEqual(0, cleanup_event["failed_files"])
 
+    def test_cleanup_does_not_follow_symbolic_linked_device_directory(self):
+        now = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            external_directory = data_dir / "external-device-archive"
+            external_file = external_directory / "expired.jsonl"
+            external_directory.mkdir()
+            external_file.write_bytes(b"outside")
+            stale_timestamp = (now - timedelta(days=31)).timestamp()
+            os.utime(external_file, (stale_timestamp, stale_timestamp))
+            (data_dir / "devices").mkdir()
+            (data_dir / "devices" / "device-external").symlink_to(
+                external_directory, target_is_directory=True
+            )
+
+            storage = Storage(data_dir)
+            storage.cleanup_expired_files(30, now, "startup")
+            cleanup_event = self._read_events(data_dir)[-1]
+
+            self.assertTrue(external_file.exists())
+
+        self.assertEqual(0, cleanup_event["deleted_files"])
+
     def test_merges_device_records_from_multiple_clients_into_one_jsonl_session(self):
         clock = MutableUtcClock(datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc))
         first_line = b'{"deviceId":"D1"}\n'
