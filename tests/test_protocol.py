@@ -66,6 +66,12 @@ class JsonlStreamParserTest(unittest.TestCase):
                 "json_not_object",
                 "missing_device_id",
             ),
+            rejected_raw_bytes=(
+                b"\xff\n",
+                b'{"deviceId":\n',
+                b'["D1"]\n',
+                b'{"deviceId":""}\n',
+            ),
         )
 
     def test_rejects_invalid_utf8(self):
@@ -108,6 +114,7 @@ class JsonlStreamParserTest(unittest.TestCase):
             raw_lines=(first_line, first_line),
             device_ids=("D1", "D1"),
             reasons=("device_id_changed",),
+            rejected_raw_bytes=(changed_line,),
         )
 
     def test_accepts_line_at_exactly_the_limit_when_newline_arrives_later(self):
@@ -169,12 +176,14 @@ class JsonlStreamParserTest(unittest.TestCase):
     def test_clears_buffer_after_complete_line_exceeds_limit(self):
         parser = JsonlStreamParser(64)
         valid_line = b'{"deviceId":"D1"}\n'
+        overlong_line = b"x" * 65 + b"\n"
 
-        result = parser.feed(b"x" * 65 + b"\n" + valid_line)
+        result = parser.feed(overlong_line + valid_line)
 
         self.assert_result(
             result,
             reasons=("line_too_long",),
+            rejected_raw_bytes=(overlong_line,),
             close_connection=True,
         )
         self.assert_empty_result(parser.feed(b""))
