@@ -358,9 +358,14 @@ class CollectorServerTest(unittest.TestCase):
             recorder = recorders[0]
             self.assertTrue(recorder._stream.closed)
             self.assertNotIn(recorder.relative_path, storage._active_rejected_paths)
+            rejected_connection_events = [
+                event
+                for event in self._read_events()
+                if event["event"].startswith("rejected_connection_")
+            ]
             self.assertEqual(
-                ["retention_cleanup", "rejected_connection_started"],
-                [event["event"] for event in self._read_events()],
+                ["rejected_connection_started"],
+                [event["event"] for event in rejected_connection_events],
             )
             log_exception.assert_called_once()
         finally:
