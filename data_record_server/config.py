@@ -4,6 +4,9 @@ from pathlib import Path
 from typing import Mapping, Optional
 
 
+MAX_JSON_LINE_BYTES = 65536
+
+
 @dataclass(frozen=True)
 class Config:
     host: str
@@ -11,6 +14,7 @@ class Config:
     data_dir: Path
     read_buffer_bytes: int
     idle_timeout_seconds: int = 30
+    max_json_line_bytes: int = MAX_JSON_LINE_BYTES
 
     @classmethod
     def from_environ(
@@ -24,6 +28,10 @@ class Config:
         idle_timeout_seconds = _parse_integer(
             environment.get("IDLE_TIMEOUT_SECONDS", "30"), "IDLE_TIMEOUT_SECONDS"
         )
+        max_json_line_bytes = _parse_integer(
+            environment.get("MAX_JSON_LINE_BYTES", str(MAX_JSON_LINE_BYTES)),
+            "MAX_JSON_LINE_BYTES",
+        )
 
         if not 1 <= port <= 65535:
             raise ValueError("TCP_PORT must be between 1 and 65535")
@@ -31,6 +39,8 @@ class Config:
             raise ValueError("READ_BUFFER_BYTES must be positive")
         if idle_timeout_seconds <= 0:
             raise ValueError("IDLE_TIMEOUT_SECONDS must be positive")
+        if max_json_line_bytes <= 0:
+            raise ValueError("MAX_JSON_LINE_BYTES must be positive")
 
         return cls(
             host=environment.get("TCP_HOST", "0.0.0.0"),
@@ -38,6 +48,7 @@ class Config:
             data_dir=Path(environment.get("DATA_DIR", "/data")),
             read_buffer_bytes=read_buffer_bytes,
             idle_timeout_seconds=idle_timeout_seconds,
+            max_json_line_bytes=max_json_line_bytes,
         )
 
 

@@ -22,6 +22,14 @@ class JsonlStreamParserTest(unittest.TestCase):
     def test_rejects_invalid_json(self):
         self.assert_rejection_is_recoverable(b'{"deviceId":\n', "invalid_json")
 
+    def test_rejects_non_standard_json_number_constants(self):
+        for constant in (b"NaN", b"Infinity", b"-Infinity"):
+            with self.subTest(constant=constant):
+                self.assert_rejection_is_recoverable(
+                    b'{"deviceId":"D1","value":' + constant + b"}\n",
+                    "invalid_json",
+                )
+
     def test_rejects_json_that_is_not_an_object(self):
         self.assert_rejection_is_recoverable(b'["D1"]\n', "json_not_object")
 
@@ -68,6 +76,17 @@ class JsonlStreamParserTest(unittest.TestCase):
 
         self.assertEqual("line_too_long", context.exception.reason)
         self.assert_accepted_d1(parser.feed(b'{"deviceId":"D1"}\n'))
+
+    def test_clears_buffer_after_complete_line_exceeds_limit(self):
+        parser = JsonlStreamParser(64)
+        valid_line = b'{"deviceId":"D1"}\n'
+
+        with self.assertRaises(RecordRejected) as context:
+            parser.feed(b"x" * 65 + b"\n" + valid_line)
+
+        self.assertEqual("line_too_long", context.exception.reason)
+        self.assertEqual([], parser.feed(b""))
+        self.assert_accepted_d1(parser.feed(valid_line))
 
     def test_rejects_incomplete_line_at_end_of_stream(self):
         parser = JsonlStreamParser(64)
