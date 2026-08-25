@@ -192,6 +192,97 @@ class StorageTest(unittest.TestCase):
         self.assertEqual("203.0.113.7", events[0]["client_ip"])
         self.assertEqual(5007, events[0]["client_port"])
 
+    def test_rejected_connection_appends_rejections_to_one_diagnostic_bin(self):
+        clock = MutableUtcClock(datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc))
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(directory, clock=clock)
+            recorder = storage.open_rejected_connection(("203.0.113.7", 5007))
+            recorder.record_rejected("invalid_json", b"bad\n")
+            recorder.record_rejected("invalid_utf8", b"\xff\n")
+            recorder.close("eof")
+            connection_files = list((Path(directory) / "connections").glob("*.bin"))
+            connection_bytes = connection_files[0].read_bytes()
+            events = self._read_events(directory)
+
+        self.assertEqual(1, len(connection_files))
+        self.assertEqual(b"bad\n\xff\n", connection_bytes)
+        self.assertEqual(
+            [
+                "rejected_connection_started",
+                "record_rejected",
+                "record_rejected",
+                "rejected_connection_closed",
+            ],
+            [event["event"] for event in events],
+        )
+        relative_path = "connections/" + connection_files[0].name
+        self.assertEqual(relative_path, events[0]["file"])
+        self.assertEqual("203.0.113.7", events[0]["client_ip"])
+        self.assertEqual(5007, events[0]["client_port"])
+        self.assertEqual("invalid_json", events[1]["reason"])
+        self.assertEqual(relative_path, events[1]["file"])
+        self.assertEqual(4, events[1]["rejected_bytes"])
+        self.assertEqual(4, events[1]["total_bytes"])
+        self.assertEqual("invalid_utf8", events[2]["reason"])
+        self.assertEqual(relative_path, events[2]["file"])
+        self.assertEqual(2, events[2]["rejected_bytes"])
+        self.assertEqual(6, events[2]["total_bytes"])
+        self.assertEqual(relative_path, events[3]["file"])
+        self.assertEqual(6, events[3]["total_bytes"])
+        self.assertEqual("eof", events[3]["reason"])
+
+    def test_rejected_connection_uses_a_safe_ipv6_filename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(directory)
+            recorder = storage.open_rejected_connection(("2001:db8::1", 5007))
+            recorder.close("eof")
+            connection_file = next((Path(directory) / "connections").glob("*.bin"))
+
+        self.assertNotIn(":", connection_file.name)
+        self.assertIn("2001_db8__1", connection_file.name)
+
+    def test_does_not_create_connections_directory_without_a_rejection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            Storage(directory)
+
+            self.assertFalse((Path(directory) / "connections").exists())
+
+    def test_rejected_connection_close_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(directory)
+            recorder = storage.open_rejected_connection(("203.0.113.7", 5007))
+
+            self.assertTrue(recorder.close("eof"))
+            self.assertFalse(recorder.close("eof"))
+            events = self._read_events(directory)
+
+        self.assertEqual(
+            ["rejected_connection_started", "rejected_connection_closed"],
+            [event["event"] for event in events],
+        )
+
+    def test_rejected_connection_close_event_failure_releases_active_path_and_stream(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(directory)
+            recorder = storage.open_rejected_connection(("203.0.113.7", 5007))
+            events = recorder._events
+            failing_events = mock.Mock()
+
+            def fail_only_close(event):
+                if event["event"] == "rejected_connection_closed":
+                    raise OSError("event write failed")
+                events.write(event)
+
+            failing_events.write.side_effect = fail_only_close
+            recorder._events = failing_events
+
+            with self.assertRaisesRegex(OSError, "event write failed"):
+                recorder.close("eof")
+
+            self.assertTrue(recorder._stream.closed)
+            self.assertNotIn(recorder.relative_path, storage._active_rejected_paths)
+
     def test_expires_session_at_idle_timeout_boundary_and_removes_it_from_active_sessions(self):
         clock = MutableUtcClock(datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc))
         raw_line = b'{"deviceId":"D1"}\n'

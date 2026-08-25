@@ -156,6 +156,92 @@ class DeviceSession:
             raise close_error
 
 
+class RejectedConnectionRecorder:
+    """Persist rejected records from one TCP connection in a diagnostic BIN."""
+
+    def __init__(
+        self,
+        client_address: ClientAddress,
+        relative_path: str,
+        stream: BinaryIO,
+        events: JsonlEventWriter,
+        clock: Clock,
+        on_close: Callable[[str], None],
+    ) -> None:
+        self.relative_path = relative_path
+        self._client_address = client_address
+        self._stream = stream
+        self._events = events
+        self._clock = clock
+        self._on_close = on_close
+        self._total_bytes = 0
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def record_rejected(self, reason: str, raw_bytes: bytes) -> None:
+        """Append rejected bytes before recording their diagnostic event."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("cannot record to a closed rejected connection")
+            self._stream.write(raw_bytes)
+            self._stream.flush()
+            self._total_bytes += len(raw_bytes)
+            client_ip, client_port = self._client_address
+            self._events.write(
+                {
+                    "event": "record_rejected",
+                    "time": format_time(self._clock()),
+                    "file": self.relative_path,
+                    "client_ip": client_ip,
+                    "client_port": client_port,
+                    "reason": reason,
+                    "rejected_bytes": len(raw_bytes),
+                    "total_bytes": self._total_bytes,
+                }
+            )
+
+    def close(self, reason: str) -> bool:
+        """Close once, persist the close event, and release the active path."""
+        with self._lock:
+            if self._closed:
+                return False
+            self._closed = True
+            close_error = None  # type: Optional[BaseException]
+            try:
+                self._stream.close()
+            except BaseException as error:
+                close_error = error
+            try:
+                self._events.write(
+                    {
+                        "event": "rejected_connection_closed",
+                        "time": format_time(self._clock()),
+                        "file": self.relative_path,
+                        "total_bytes": self._total_bytes,
+                        "reason": reason,
+                    }
+                )
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+            finally:
+                self._on_close(self.relative_path)
+            if close_error is not None:
+                raise close_error
+            return True
+
+    def abandon(self) -> None:
+        """Close a newly created diagnostic stream without lifecycle events."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self._stream.close()
+            finally:
+                self._on_close(self.relative_path)
+
+
 class Storage:
     """Maintain active device sessions and record their lifecycle events."""
 
@@ -166,6 +252,8 @@ class Storage:
         self._clock = clock
         self._sessions: Dict[str, DeviceSession] = {}
         self._sessions_lock = threading.Lock()
+        self._active_rejected_paths: Set[str] = set()
+        self._rejected_paths_lock = threading.Lock()
 
     def append_record(
         self, client_address: ClientAddress, device_id: str, raw_line: bytes
@@ -191,6 +279,59 @@ class Storage:
                 "reason": reason,
             }
         )
+
+    def open_rejected_connection(
+        self, client_address: ClientAddress
+    ) -> RejectedConnectionRecorder:
+        """Create one diagnostic BIN for rejected records on a TCP connection."""
+        client_ip, client_port = client_address
+        created_at = self._clock()
+        timestamp = created_at.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        safe_client_ip = client_ip.replace(":", "_")
+        directory = self._data_dir / "connections"
+        filename = "{}_{}_{}_{}.bin".format(
+            timestamp, safe_client_ip, client_port, uuid.uuid4().hex[:8]
+        )
+        path = directory / filename
+        relative_path = path.relative_to(self._data_dir).as_posix()
+
+        directory.mkdir(parents=True, exist_ok=True)
+        stream = path.open("xb")
+        recorder = RejectedConnectionRecorder(
+            client_address,
+            relative_path,
+            stream,
+            self._events,
+            self._clock,
+            self._remove_active_rejected_path,
+        )
+        try:
+            self._events.write(
+                {
+                    "event": "rejected_connection_started",
+                    "time": format_time(created_at),
+                    "file": relative_path,
+                    "client_ip": client_ip,
+                    "client_port": client_port,
+                }
+            )
+        except BaseException:
+            try:
+                recorder.abandon()
+            except BaseException:
+                pass
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+            raise
+        with self._rejected_paths_lock:
+            self._active_rejected_paths.add(relative_path)
+        return recorder
 
     def expire_sessions(self, idle_timeout_seconds: float) -> None:
         """Close and remove device sessions that have reached their idle timeout."""
@@ -271,3 +412,8 @@ class Storage:
                 pass
             raise
         return session
+
+    def _remove_active_rejected_path(self, relative_path: str) -> None:
+        """Remove a closed diagnostic file from the cleanup exclusion set."""
+        with self._rejected_paths_lock:
+            self._active_rejected_paths.discard(relative_path)
