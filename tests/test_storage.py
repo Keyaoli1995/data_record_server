@@ -130,6 +130,46 @@ class StorageTest(unittest.TestCase):
 
         self.assertEqual(0, cleanup_event["deleted_files"])
 
+    def test_cleanup_does_not_follow_symbolic_linked_connections_directory(self):
+        now = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            external_directory = data_dir / "external-connections"
+            external_file = external_directory / "expired.bin"
+            external_directory.mkdir()
+            external_file.write_bytes(b"outside")
+            stale_timestamp = (now - timedelta(days=31)).timestamp()
+            os.utime(external_file, (stale_timestamp, stale_timestamp))
+            (data_dir / "connections").symlink_to(
+                external_directory, target_is_directory=True
+            )
+
+            storage = Storage(data_dir)
+            storage.cleanup_expired_files(30, now, "startup")
+
+            self.assertTrue(external_file.exists())
+
+    def test_cleanup_does_not_follow_symbolic_linked_devices_directory(self):
+        now = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            external_directory = data_dir / "external-devices"
+            external_file = external_directory / "device-D1" / "expired.jsonl"
+            external_file.parent.mkdir(parents=True)
+            external_file.write_bytes(b"outside")
+            stale_timestamp = (now - timedelta(days=31)).timestamp()
+            os.utime(external_file, (stale_timestamp, stale_timestamp))
+            (data_dir / "devices").symlink_to(
+                external_directory, target_is_directory=True
+            )
+
+            storage = Storage(data_dir)
+            storage.cleanup_expired_files(30, now, "startup")
+
+            self.assertTrue(external_file.exists())
+
     def test_merges_device_records_from_multiple_clients_into_one_jsonl_session(self):
         clock = MutableUtcClock(datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc))
         first_line = b'{"deviceId":"D1"}\n'

@@ -402,7 +402,7 @@ class Storage:
             deleted_files += 1
             reclaimed_bytes += file_status.st_size
 
-        for directory in self._data_dir.joinpath("devices").glob("device-*"):
+        for directory in self._device_directories():
             try:
                 if stat.S_ISDIR(directory.lstat().st_mode):
                     directory.rmdir()
@@ -470,10 +470,24 @@ class Storage:
             self._active_rejected_paths.discard(relative_path)
 
     def _expired_archive_paths(self):
-        yield from self._data_dir.joinpath("connections").glob("*.bin")
-        for directory in self._data_dir.joinpath("devices").glob("device-*"):
+        connections_directory = self._data_dir / "connections"
+        if self._is_real_directory(connections_directory):
+            yield from connections_directory.glob("*.bin")
+        for directory in self._device_directories():
             try:
                 if stat.S_ISDIR(directory.lstat().st_mode):
                     yield from directory.glob("*.jsonl")
             except OSError:
                 continue
+
+    def _device_directories(self):
+        devices_directory = self._data_dir / "devices"
+        if self._is_real_directory(devices_directory):
+            yield from devices_directory.glob("device-*")
+
+    @staticmethod
+    def _is_real_directory(path: Path) -> bool:
+        try:
+            return stat.S_ISDIR(path.lstat().st_mode)
+        except OSError:
+            return False
