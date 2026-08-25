@@ -2,7 +2,7 @@
 
 import json
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 
 @dataclass(frozen=True)
@@ -80,7 +80,7 @@ class JsonlStreamParser:
             return FeedResult((), (RecordRejected("incomplete_line"),))
         return FeedResult.empty()
 
-    def _parse_line(self, raw_line: bytes) -> AcceptedRecord | RecordRejected:
+    def _parse_line(self, raw_line: bytes) -> Union[AcceptedRecord, RecordRejected]:
         try:
             decoded_line = raw_line.decode("utf-8")
         except UnicodeDecodeError:
