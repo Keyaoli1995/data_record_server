@@ -31,13 +31,14 @@ class CollectorRequestHandler(socketserver.BaseRequestHandler):
             while True:
                 data = self.request.recv(self.server.read_buffer_bytes)
                 if not data:
-                    self._store_feed_result(parser.finish())
+                    self._finish_stream(parser)
                     break
                 result = parser.feed(data)
                 self._store_feed_result(result)
                 if result.close_connection:
                     return
         except socket.timeout:
+            self._finish_stream(parser)
             return
         except Exception:
             LOGGER.exception(
@@ -51,6 +52,9 @@ class CollectorRequestHandler(socketserver.BaseRequestHandler):
             )
         for rejection in result.rejections:
             self.server.storage.record_rejected(self.client_address, rejection.reason)
+
+    def _finish_stream(self, parser: JsonlStreamParser) -> None:
+        self._store_feed_result(parser.finish())
 
 
 class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):

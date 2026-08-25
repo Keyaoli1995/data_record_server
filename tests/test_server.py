@@ -251,6 +251,26 @@ class CollectorServerTest(unittest.TestCase):
 
         self.assertEqual([], self._device_files())
 
+    def test_rejects_an_incomplete_record_when_socket_times_out(self):
+        server, server_thread = self._create_server_with_idle_timeout(0.15)
+        try:
+            with socket.create_connection(server.server_address, timeout=2) as client:
+                client.sendall(b'{"deviceId":"D1"')
+                self._wait_for(
+                    lambda: [event["reason"] for event in self._rejection_events()]
+                    == ["incomplete_line"]
+                )
+                client.settimeout(2)
+                self.assertEqual(b"", client.recv(1))
+
+            self.assertEqual([], self._device_files())
+            self.assertEqual([], self._session_events())
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+            self.assertFalse(server_thread.is_alive())
+
     def test_expires_a_device_session_after_its_idle_timeout(self):
         server, server_thread = self._create_server_with_idle_timeout(0.15)
         try:
