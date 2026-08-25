@@ -11,6 +11,7 @@ import threading
 from typing import Callable, Tuple
 
 from .config import Config
+from .protocol import JsonlStreamParser
 from .storage import Storage
 
 
@@ -21,48 +22,35 @@ ServerAddress = Tuple[str, int]
 
 
 class CollectorRequestHandler(socketserver.BaseRequestHandler):
-    """Record every byte received from one TCP client connection."""
+    """Parse and persist JSONL records received from one TCP connection."""
 
     def handle(self) -> None:
-        recorder = None
+        parser = JsonlStreamParser(self.server.max_json_line_bytes)
         try:
-            recorder = self.server.storage.open_connection(self.client_address)
             self.request.settimeout(self.server.idle_timeout_seconds)
             while True:
                 data = self.request.recv(self.server.read_buffer_bytes)
                 if not data:
+                    self._store_feed_result(parser.finish())
                     break
-                recorder.record_received(data)
+                result = parser.feed(data)
+                self._store_feed_result(result)
+                if result.close_connection:
+                    return
         except socket.timeout:
-            if recorder is not None:
-                try:
-                    recorder.record_idle_timeout(self.server.idle_timeout_seconds)
-                except Exception:
-                    LOGGER.exception(
-                        "Failed to record idle timeout for client connection from %s",
-                        self.client_address,
-                    )
-        except Exception as error:
-            if recorder is not None:
-                try:
-                    recorder.record_error(error)
-                except Exception:
-                    LOGGER.exception(
-                        "Failed to record client connection error from %s",
-                        self.client_address,
-                    )
+            return
+        except Exception:
             LOGGER.exception(
                 "Failed while recording client connection from %s", self.client_address
             )
-        finally:
-            if recorder is not None:
-                try:
-                    recorder.close()
-                except Exception:
-                    LOGGER.exception(
-                        "Failed to close client connection recorder for %s",
-                        self.client_address,
-                    )
+
+    def _store_feed_result(self, result) -> None:
+        for record in result.records:
+            self.server.storage.append_record(
+                self.client_address, record.device_id, record.raw_line
+            )
+        for rejection in result.rejections:
+            self.server.storage.record_rejected(self.client_address, rejection.reason)
 
 
 class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -77,12 +65,16 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         storage: Storage,
         read_buffer_bytes: int,
         idle_timeout_seconds: float = 30,
+        max_json_line_bytes: int = 65536,
     ) -> None:
         self.storage = storage
         self.read_buffer_bytes = read_buffer_bytes
         self.idle_timeout_seconds = idle_timeout_seconds
+        self.max_json_line_bytes = max_json_line_bytes
         self._active_requests = set()
         self._active_requests_condition = threading.Condition()
+        self._sessions_close_lock = threading.Lock()
+        self._sessions_closed = False
         self._shutdown_coordinator = None
         self._shutdown_coordinator_lock = threading.Lock()
         self._shutdown_coordinator_state = threading.Condition()
@@ -122,7 +114,31 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
     def shutdown(self) -> None:
         """Stop accepting clients and finish cleanup for active connections."""
-        super().shutdown()
+        primary_error = None
+        try:
+            super().shutdown()
+        except BaseException as error:
+            primary_error = error
+
+        primary_error = self._run_cleanup_step(
+            self._close_active_requests_and_wait,
+            "Failed to close active TCP client requests during shutdown",
+            primary_error,
+        )
+        primary_error = self._run_cleanup_step(
+            self._close_all_sessions_once,
+            "Failed to close active device sessions during shutdown",
+            primary_error,
+        )
+        if primary_error is not None:
+            raise primary_error
+
+    def service_actions(self) -> None:
+        """Expire inactive device sessions between request polls."""
+        self.storage.expire_sessions(self.idle_timeout_seconds)
+        super().service_actions()
+
+    def _close_active_requests_and_wait(self) -> None:
         with self._active_requests_condition:
             active_requests = tuple(self._active_requests)
 
@@ -135,6 +151,13 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         with self._active_requests_condition:
             while self._active_requests:
                 self._active_requests_condition.wait()
+
+    def _close_all_sessions_once(self) -> None:
+        with self._sessions_close_lock:
+            if self._sessions_closed:
+                return
+            self._sessions_closed = True
+        self.storage.close_all_sessions()
 
     def serve_forever(self, poll_interval: float = 0.5) -> None:
         """Run the base server after making coordinator shutdown safe."""
@@ -224,12 +247,39 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             if tcp_close_error is not None:
                 raise tcp_close_error
             return
-        try:
-            self.cancel_shutdown_coordinator()
-            self.wait_for_shutdown_coordinator()
-            super().server_close()
-        finally:
-            self._close_shutdown_pipe()
+        primary_error = None
+        primary_error = self._run_cleanup_step(
+            self.cancel_shutdown_coordinator,
+            "Failed to cancel TCP shutdown coordinator",
+            primary_error,
+        )
+        primary_error = self._run_cleanup_step(
+            self.wait_for_shutdown_coordinator,
+            "Failed to wait for TCP shutdown coordinator",
+            primary_error,
+        )
+        primary_error = self._run_cleanup_step(
+            self._close_active_requests_and_wait,
+            "Failed to close active TCP client requests during server close",
+            primary_error,
+        )
+        primary_error = self._run_cleanup_step(
+            self._close_all_sessions_once,
+            "Failed to close active device sessions during server close",
+            primary_error,
+        )
+        primary_error = self._run_cleanup_step(
+            super().server_close,
+            "Failed to close TCP server socket",
+            primary_error,
+        )
+        primary_error = self._run_cleanup_step(
+            self._close_shutdown_pipe,
+            "Failed to close TCP shutdown pipe",
+            primary_error,
+        )
+        if primary_error is not None:
+            raise primary_error
 
     def _run_shutdown_coordinator(self) -> None:
         try:
@@ -277,6 +327,17 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
                 "Failed to close TCP shutdown pipe during construction"
             )
 
+    def _run_cleanup_step(
+        self, operation, message: str, primary_error: BaseException
+    ) -> BaseException:
+        try:
+            operation()
+        except BaseException as error:
+            if primary_error is None:
+                return error
+            self._log_cleanup_failure(message)
+        return primary_error
+
     @staticmethod
     def _log_cleanup_failure(message: str) -> None:
         try:
@@ -292,6 +353,7 @@ def create_server(config: Config) -> CollectorServer:
         Storage(config.data_dir),
         config.read_buffer_bytes,
         config.idle_timeout_seconds,
+        config.max_json_line_bytes,
     )
 
 
