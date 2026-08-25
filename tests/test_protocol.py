@@ -138,6 +138,21 @@ class JsonlStreamParserTest(unittest.TestCase):
         )
         self.assert_empty_result(parser.feed(b""))
 
+    def test_preserves_prior_results_before_unterminated_line_exceeds_limit(self):
+        parser = JsonlStreamParser(64)
+        valid_line = b'{"deviceId":"D1"}\n'
+
+        result = parser.feed(valid_line + b'{"deviceId":\n' + b"x" * 65)
+
+        self.assert_result(
+            result,
+            raw_lines=(valid_line,),
+            device_ids=("D1",),
+            reasons=("invalid_json", "line_too_long"),
+            close_connection=True,
+        )
+        self.assert_empty_result(parser.feed(b""))
+
     def test_clears_buffer_after_complete_line_exceeds_limit(self):
         parser = JsonlStreamParser(64)
         valid_line = b'{"deviceId":"D1"}\n'

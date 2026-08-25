@@ -59,14 +59,16 @@ class JsonlStreamParser:
             if newline_index < 0:
                 if len(self._buffer) > self._max_line_bytes:
                     self._buffer.clear()
-                    return FeedResult((), (RecordRejected("line_too_long"),), True)
+                    rejections.append(RecordRejected("line_too_long"))
+                    return FeedResult(tuple(records), tuple(rejections), True)
                 return FeedResult(tuple(records), tuple(rejections))
 
             raw_line = bytes(self._buffer[: newline_index + 1])
             del self._buffer[: newline_index + 1]
             if len(raw_line) - 1 > self._max_line_bytes:
                 self._buffer.clear()
-                return FeedResult((), (RecordRejected("line_too_long"),), True)
+                rejections.append(RecordRejected("line_too_long"))
+                return FeedResult(tuple(records), tuple(rejections), True)
 
             parsed_line = self._parse_line(raw_line)
             if isinstance(parsed_line, RecordRejected):
