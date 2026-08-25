@@ -216,6 +216,51 @@ class DeploymentFilesTest(unittest.TestCase):
             self.assertEqual(b"captured bytes", sample_file.read_bytes())
             self.assertTrue(os.access(sample_file, os.R_OK | os.W_OK))
 
+    def test_prepare_data_dir_script_follows_an_invocation_symlink_to_its_repository(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository, script = self._copy_preparation_script(temporary_directory)
+            external_directory = Path(temporary_directory) / "external"
+            external_directory.mkdir()
+            external_script = external_directory / script.name
+            external_script.symlink_to(script)
+            external_parent = external_directory.parent
+            external_parent_stat = external_parent.stat()
+            external_directory_stat = external_directory.stat()
+            unexpected_data_dir = external_parent / "data"
+            collector_uid, collector_gid = self._collector_identity()
+
+            result = subprocess.run(
+                [str(external_script)],
+                cwd=external_directory,
+                env=os.environ
+                | {
+                    "COLLECTOR_UID": str(collector_uid),
+                    "COLLECTOR_GID": str(collector_gid),
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            expected_data_dir = repository / "data"
+            self.assertTrue(expected_data_dir.is_dir())
+            self.assertEqual(collector_uid, expected_data_dir.stat().st_uid)
+            self.assertEqual(collector_gid, expected_data_dir.stat().st_gid)
+            self.assertFalse(unexpected_data_dir.exists())
+            for path, original_stat in (
+                (external_parent, external_parent_stat),
+                (external_directory, external_directory_stat),
+            ):
+                updated_stat = path.stat()
+                self.assertEqual(original_stat.st_uid, updated_stat.st_uid)
+                self.assertEqual(original_stat.st_gid, updated_stat.st_gid)
+                self.assertEqual(
+                    stat.S_IMODE(original_stat.st_mode),
+                    stat.S_IMODE(updated_stat.st_mode),
+                )
+
     def test_prepare_data_dir_repairs_key_paths_for_storage(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             repository, script = self._copy_preparation_script(temporary_directory)

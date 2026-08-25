@@ -66,6 +66,9 @@ docker compose ps
 sudo env COLLECTOR_UID=1000 COLLECTOR_GID=1000 scripts/prepare-data-dir.sh
 docker compose config --quiet
 docker compose up -d --build
+
+# 上述 .env 示例的 TCP_PORT=30100
+docker compose port collector 30100
 ```
 
 同时在云安全组和宿主机防火墙中，仅向需要的来源 IP 放行实际 TCP 端口。
@@ -75,6 +78,8 @@ docker compose up -d --build
 ```bash
 docker compose ps
 docker compose logs --tail=100 collector
+
+# 默认配置的 TCP_PORT=30050
 docker compose port collector 30050
 
 # 查看设备会话事件

@@ -60,7 +60,7 @@ docker compose up -d --build
 
 在阿里云安全组和宿主机防火墙中，为实际端口创建 TCP 入方向规则，并限制到设备/运维网络的来源 IP。不要长期使用 `0.0.0.0/0`。安全组只允许流量进入，监听由容器中的服务完成。
 
-检查发布端口：
+检查默认配置（`TCP_PORT=30050`）的发布端口：
 
 ```bash
 docker compose port collector 30050
@@ -69,15 +69,35 @@ sudo ss -ltnp | grep ':30050'
 
 `docker compose port` 是 Docker 映射的准确信息；`ss` 仅作宿主机辅助观察。
 
+若使用上文示例的 `.env`（`TCP_PORT=30100`），请使用同一个自定义端口，而不是默认端口：
+
+```bash
+docker compose port collector 30100
+sudo ss -ltnp | grep ':30100'
+```
+
 ## 验证设备记录
 
-从可访问服务器的客户端发送一条符合契约的 JSONL 记录：
+从可访问服务器的客户端向默认端口发送一条符合契约的 JSONL 记录：
 
 ```bash
 python3 - <<'PY'
 import socket
 
 with socket.create_connection(("8.134.210.73", 30050), timeout=5) as sock:
+    sock.sendall(b'{"deviceId":"deploy-check","sequence":1}\n')
+
+print("已发送 JSONL 测试记录")
+PY
+```
+
+若使用上文 `TCP_PORT=30100` 的 `.env` 示例，客户端同样必须使用 `30100`：
+
+```bash
+python3 - <<'PY'
+import socket
+
+with socket.create_connection(("8.134.210.73", 30100), timeout=5) as sock:
     sock.sendall(b'{"deviceId":"deploy-check","sequence":1}\n')
 
 print("已发送 JSONL 测试记录")
