@@ -1,109 +1,58 @@
-# Device-Session Recording Design
+# 按设备会话录制设计
 
-## Goal
+## 目标
 
-Store all valid JSONL data from one `deviceId` in one raw `.bin` file while
-that device continues recording, even if its public IP, source port, or TCP
-connection changes. A device session ends only after 30 consecutive seconds
-without a valid record from that device.
+当同一设备在连续录制期间更换公网 IP、源端口或 TCP 连接时，仍将其全部有效 JSONL 数据保存到同一个原始 `.bin` 文件中。只有该设备连续 30 秒未收到有效记录时，才结束本次设备会话。
 
-## Scope and protocol contract
+## 范围与协议约定
 
-The collector becomes protocol-aware for its input acceptance rule. A record is
-accepted only when it is one complete UTF-8 JSON line whose top-level value is
-an object with a non-empty string `deviceId`. The original bytes of every
-accepted line, including its LF or CRLF line ending, are appended unchanged to
-the session file.
+采集器将按输入协议校验数据。仅当一条记录同时满足以下条件时才接受：它是完整的一行 UTF-8 JSON；JSON 顶层值是对象；对象包含非空字符串 `deviceId`。每条被接受记录的原始字节（包括原有的 LF 或 CRLF 换行）会不经修改地追加到会话文件。
 
-Incomplete data remains buffered until a line ending arrives. Invalid UTF-8,
-invalid JSON, a non-object JSON value, a missing/empty `deviceId`, and a later
-line in the same TCP connection whose `deviceId` differs from that connection's
-first accepted device ID are rejected and never written to a `.bin` file. The
-connection stays open so a later valid line can be accepted; each rejection is
-recorded in `events.jsonl` with a reason and the connection metadata.
+未形成完整行的数据将暂存，直到接收到换行符。无效 UTF-8、无效 JSON、JSON 顶层不是对象、缺少或为空的 `deviceId`，以及同一 TCP 连接后续记录的 `deviceId` 与该连接第一条有效记录不一致，均会被拒绝且绝不写入 `.bin`。连接保持打开，以便后续有效行仍可被接收；每次拒绝都在 `events.jsonl` 中记录原因和连接元数据。
 
-This intentionally removes support for recording arbitrary or non-JSONL byte
-streams. Existing X8-M1 traffic satisfies this contract.
+这项改动明确不再支持任意格式或非 JSONL 的原始字节流录制。现有 X8-M1 上报数据满足该协议约定。
 
-## Session model
+## 会话模型
 
-`deviceId` is the sole identity and grouping key; client IP and port remain
-diagnostic metadata only. `DeviceSessionManager` owns a process-local mapping
-from `deviceId` to one active session. It serializes session lookup/creation and
-uses a per-session lock for appending accepted records, so two briefly
-overlapping reconnects for the same device cannot create two files or corrupt
-the byte stream.
+`deviceId` 是唯一的设备身份与归并键；客户端 IP 和端口仅保留为诊断信息。`DeviceSessionManager` 在进程内维护 `deviceId` 到活动会话的一对一映射，负责串行化会话查找与创建；每个会话另有写入锁。因此，同一设备短暂重连并发时不会创建两份文件，也不会破坏文件字节流。
 
-On the first accepted record for a device, the manager creates:
+设备第一条有效记录到达时，管理器创建如下文件：
 
 ```text
 data/devices/device-<URL-escaped-deviceId>/
   <UTC-session-start>_<URL-escaped-deviceId>_<random>.bin
 ```
 
-The `device-` prefix prevents path traversal even for unusual IDs; the original
-`deviceId` is also kept unchanged in lifecycle events. An accepted record from
-any subsequent TCP connection for that ID is appended to the existing open
-file and refreshes its last-valid-record time. Receive ordering is the order in
-which the server serializes accepted lines; the service does not reorder by
-device timestamps.
+`device-` 前缀可阻止异常 ID 造成路径穿越；原始 `deviceId` 同时保留在生命周期事件中。该设备之后任意 TCP 连接的有效记录，都会追加到同一个仍打开的文件，并刷新该设备的最后有效记录时间。文件中记录的顺序是服务端串行化接受各行的顺序；服务不按设备时间戳重新排序。
 
-The manager runs a bounded periodic expiry check. It closes a session and
-removes it from the active mapping only when `now - last_valid_record_at >=
-IDLE_TIMEOUT_SECONDS`. The default remains 30 seconds. A record received
-before expiry joins the existing session; a record received after expiry starts
-a new session file. Server shutdown closes all active session files and records
-their terminal events before process exit.
+管理器通过有限频率的后台检查回收过期会话。仅当 `now - last_valid_record_at >= IDLE_TIMEOUT_SECONDS` 时，才关闭文件并从活动映射中移除会话；默认值仍为 30 秒。过期前到达的记录加入原会话；过期后到达的记录创建新会话文件。服务关闭时，必须先关闭全部活动会话文件并写入终止事件，再退出进程。
 
-## Events and observability
+## 事件与可观测性
 
-`events.jsonl` remains diagnostic metadata; it is not an additional source of
-raw data. It records TCP connection open/close/error events with client IP and
-port, and session events with `device_id` and `file`:
+`events.jsonl` 仍仅是诊断元数据，而不是原始数据的副本。它保留 TCP 连接打开、关闭和异常事件（包含客户端 IP、端口），并增加包含 `device_id` 与 `file` 的会话事件：
 
-- `session_started` — first valid record creates a session file.
-- `session_attached` — a TCP connection first supplies valid data for an
-  existing or newly created device session.
-- `record_rejected` — invalid record or changed `deviceId`, including a stable
-  machine-readable reason.
-- `session_idle_timeout` and `session_closed` — device-level 30-second expiry
-  and final byte total.
+- `session_started`：第一条有效记录创建会话文件。
+- `session_attached`：某 TCP 连接首次向新建或既有的设备会话提供有效数据。
+- `record_rejected`：记录无效或 `deviceId` 改变，包含稳定的机器可读拒绝原因。
+- `session_idle_timeout` 与 `session_closed`：设备级 30 秒超时及最终字节总数。
 
-Connection events must not claim a file before the connection has supplied a
-valid device record. Documentation and tests will describe the new event
-schema and the `data/devices/` layout, replacing the old one-file-per-TCP-
-connection guarantee.
+在连接尚未提供有效设备记录前，连接事件不得声称它对应某个文件。文档和测试将同步更新为上述事件格式与 `data/devices/` 布局，替换旧的“一条 TCP 连接对应一个 `.bin`”保证。
 
-## Error handling and limits
+## 异常处理与限制
 
-The line parser has a configurable, finite maximum buffered line size. A
-connection that exceeds it before emitting a line writes a rejection event,
-then closes to prevent unbounded memory use. File open/write failures are
-logged and handled like existing storage failures; they must not leave a stale
-active-session entry. An invalid connection must not create empty device
-directories or `.bin` files.
+行解析器设置可配置且有限的最大缓冲行长度。连接在输出完整行前超出该上限时，写入拒绝事件并主动关闭，防止内存无限增长。文件打开或写入失败仍按现有存储失败路径记录；不得遗留无效的活动会话映射。无效连接不得创建空的设备目录或 `.bin` 文件。
 
-The initial change stays process-local and intentionally does not merge data
-across collector restarts. A restart closes the active session files; a device
-that reconnects afterwards begins a new session.
+首期实现只在当前进程内归并，不跨采集器重启合并。重启会关闭现有活动会话文件；设备在重启后重新上报时创建新会话。
 
-## Tests and acceptance criteria
+## 测试与验收标准
 
-Tests must cover, before implementation:
+实现前必须先添加并验证以下测试：
 
-1. Two TCP connections with different IP/ports but the same `deviceId` and a
-   gap below 30 seconds append their exact JSONL bytes to one session file.
-2. A gap at or above the configured idle timeout closes the first session and
-   creates a second file for the next valid record.
-3. Two device IDs remain isolated in separate directories/files, including
-   concurrent connections.
-4. Invalid, incomplete-at-close, oversized, and missing-ID input creates no
-   `.bin` file and emits a rejection event; a changed ID on one connection is
-   likewise rejected.
-5. Shutdown closes an active device session once and writes its terminal event.
-6. Existing configuration validation, container/deployment checks, and the
-   full unit-test suite continue to pass.
+1. 不同 IP/端口的两条 TCP 连接使用相同 `deviceId`，且间隔小于 30 秒时，其 JSONL 原始字节精确追加到同一个会话文件。
+2. 间隔大于等于配置的空闲超时时，首个会话关闭，下一条有效记录创建第二个文件。
+3. 两个不同 `deviceId` 必须隔离到不同目录和文件，即使连接并发也不能混写。
+4. 无效数据、连接关闭时仍不完整的数据、超长行和缺少 ID 的数据均不创建 `.bin` 且写入拒绝事件；同一连接 ID 改变也必须被拒绝。
+5. 服务关闭时，活动设备会话仅关闭一次并写入终止事件。
+6. 既有配置校验、容器/部署检查和完整单元测试套件仍全部通过。
 
-Success means a 4G reconnect during a continuous X8-M1 recording is represented
-by one device-session `.bin` file, independent of the public IP used by each
-TCP connection.
+验收成功的含义是：X8-M1 设备通过 4G 在连续录制期间重连时，无论每条 TCP 连接使用何种公网 IP，都只对应一个设备会话 `.bin` 文件。
