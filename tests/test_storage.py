@@ -1,4 +1,4 @@
-"""Tests for raw TCP data persistence."""
+"""Contracts for device-scoped JSONL recording sessions."""
 
 import json
 import tempfile
@@ -6,169 +6,299 @@ import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest import mock
 
 from data_record_server.storage import Storage
 
 
+class MutableUtcClock:
+    """A deterministic UTC clock whose time can be advanced by a test."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += timedelta(seconds=seconds)
+
+
 class StorageTest(unittest.TestCase):
-    def test_preserves_exact_bytes_without_per_read_events(self):
-        timestamps = iter(
-            datetime(2026, 8, 10, 12, 0, 0, tzinfo=timezone.utc)
-            + timedelta(seconds=offset)
-            for offset in range(4)
-        )
+    def test_merges_device_records_from_multiple_clients_into_one_jsonl_session(self):
+        clock = MutableUtcClock(datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc))
+        first_line = b'{"deviceId":"D1"}\n'
+        second_line = b'{"deviceId":"D1","n":2}\r\n'
 
         with tempfile.TemporaryDirectory() as directory:
-            storage = Storage(directory, clock=lambda: next(timestamps))
-            recorder = storage.open_connection(("203.0.113.10", 51822))
-            recorder.record_received(b"\x7e\x00")
-            recorder.record_received(b"\xff\x0d\x0a")
-            recorder.close()
+            storage = Storage(directory, clock=clock)
+            first = storage.append_record(("203.0.113.1", 5001), "D1", first_line)
+            second = storage.append_record(("203.0.113.2", 5002), "D1", second_line)
 
-            connection_files = list((Path(directory) / "connections").glob("*.bin"))
-            self.assertEqual(1, len(connection_files))
-            self.assertEqual(b"\x7e\x00\xff\x0d\x0a", connection_files[0].read_bytes())
+            self.assertEqual(first.relative_path, second.relative_path)
+            self.assertTrue(first.relative_path.startswith("devices/device-D1/"))
+            self.assertTrue(first.relative_path.endswith(".jsonl"))
+            self.assertEqual(
+                first_line + second_line,
+                (Path(directory) / first.relative_path).read_bytes(),
+            )
 
-            events = [
-                json.loads(line)
-                for line in (Path(directory) / "events.jsonl").read_text(
-                    encoding="utf-8"
-                ).splitlines()
-            ]
+            events = self._read_events(directory)
+            storage.close_all_sessions()
 
-        relative_path = f"connections/{connection_files[0].name}"
         self.assertEqual(
-            ["connected", "disconnected"],
+            ["session_started", "session_attached", "session_attached"],
             [event["event"] for event in events],
         )
+        self.assertEqual("2026-08-10T12:00:00Z", events[0]["time"])
+        self.assertEqual(first.relative_path, events[0]["file"])
+        self.assertEqual("D1", events[0]["device_id"])
         self.assertEqual(
-            [
-                "2026-08-10T12:00:00Z",
-                "2026-08-10T12:00:01Z",
-            ],
-            [event["time"] for event in events],
+            {("203.0.113.1", 5001), ("203.0.113.2", 5002)},
+            {
+                (event["client_ip"], event["client_port"])
+                for event in events
+                if event["event"] == "session_attached"
+            },
         )
-        self.assertEqual([relative_path] * 2, [event["file"] for event in events])
-        self.assertEqual("203.0.113.10", events[0]["client_ip"])
-        self.assertEqual(51822, events[0]["client_port"])
-        self.assertEqual(5, events[1]["total_bytes"])
 
-    def test_records_connection_errors_and_closes_only_once(self):
-        timestamps = iter(
-            datetime(2026, 8, 10, 12, 0, 0, tzinfo=timezone.utc)
-            + timedelta(seconds=offset)
-            for offset in range(3)
-        )
+    def test_attaches_each_client_only_on_its_first_record_for_a_session(self):
+        clock = MutableUtcClock(datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc))
 
         with tempfile.TemporaryDirectory() as directory:
-            storage = Storage(directory, clock=lambda: next(timestamps))
-            recorder = storage.open_connection(("203.0.113.11", 51823))
-            recorder.record_error(ConnectionResetError("peer reset"))
-            recorder.close()
-            recorder.close()
-
-            events = [
-                json.loads(line)
-                for line in (Path(directory) / "events.jsonl").read_text(
-                    encoding="utf-8"
-                ).splitlines()
+            storage = Storage(directory, clock=clock)
+            session = storage.append_record(
+                ("203.0.113.3", 5003), "D1", b'{"deviceId":"D1","n":1}\n'
+            )
+            storage.append_record(
+                ("203.0.113.3", 5003), "D1", b'{"deviceId":"D1","n":2}\n'
+            )
+            storage.append_record(
+                ("203.0.113.4", 5004), "D1", b'{"deviceId":"D1","n":3}\n'
+            )
+            attachments = [
+                event
+                for event in self._read_events(directory)
+                if event["event"] == "session_attached"
             ]
-            connection_files = list((Path(directory) / "connections").glob("*.bin"))
+            storage.close_all_sessions()
 
-        self.assertEqual(1, len(connection_files))
-        relative_path = f"connections/{connection_files[0].name}"
+        self.assertEqual(2, len(attachments))
+        self.assertEqual({session.relative_path}, {event["file"] for event in attachments})
+        self.assertEqual({"D1"}, {event["device_id"] for event in attachments})
         self.assertEqual(
-            ["connected", "error", "disconnected"],
-            [event["event"] for event in events],
+            {("203.0.113.3", 5003), ("203.0.113.4", 5004)},
+            {(event["client_ip"], event["client_port"]) for event in attachments},
         )
-        self.assertEqual(
-            [
-                "2026-08-10T12:00:00Z",
-                "2026-08-10T12:00:01Z",
-                "2026-08-10T12:00:02Z",
-            ],
-            [event["time"] for event in events],
-        )
-        self.assertEqual([relative_path] * 3, [event["file"] for event in events])
-        self.assertEqual("ConnectionResetError", events[1]["error_type"])
-        self.assertEqual("peer reset", events[1]["error"])
 
-    def test_removes_file_when_connected_event_cannot_be_written(self):
+    def test_keeps_different_devices_in_separate_session_files(self):
+        clock = MutableUtcClock(datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc))
+
         with tempfile.TemporaryDirectory() as directory:
-            storage = Storage(directory)
-            with mock.patch.object(
-                storage._events, "write", side_effect=OSError("disk full")
-            ):
-                with self.assertRaisesRegex(OSError, "disk full"):
-                    storage.open_connection(("203.0.113.12", 51824))
+            storage = Storage(directory, clock=clock)
+            first = storage.append_record(
+                ("203.0.113.5", 5005), "D1", b'{"deviceId":"D1"}\n'
+            )
+            second = storage.append_record(
+                ("203.0.113.6", 5006), "D2", b'{"deviceId":"D2"}\n'
+            )
 
-            self.assertEqual([], list((Path(directory) / "connections").glob("*.bin")))
+            self.assertNotEqual(first.relative_path, second.relative_path)
+            self.assertEqual(
+                b'{"deviceId":"D1"}\n',
+                (Path(directory) / first.relative_path).read_bytes(),
+            )
+            self.assertEqual(
+                b'{"deviceId":"D2"}\n',
+                (Path(directory) / second.relative_path).read_bytes(),
+            )
+            self.assertEqual(
+                2, len(list((Path(directory) / "devices").glob("**/*.jsonl")))
+            )
+            storage.close_all_sessions()
 
-    def test_concurrent_connections_preserve_files_and_valid_event_lifecycles(self):
-        connection_count = 8
-        payloads = {
-            (f"203.0.113.{index}", 52000 + index): bytes([index, 0, 255])
-            for index in range(connection_count)
-        }
+    def test_concurrent_appends_share_one_complete_device_session(self):
+        client_count = 8
+        payloads = [
+            f'{{"deviceId":"D1","sequence":{index}}}\n'.encode("ascii")
+            for index in range(client_count)
+        ]
         failures = []
+        failures_lock = threading.Lock()
 
         with tempfile.TemporaryDirectory() as directory:
             storage = Storage(directory)
-            start = threading.Barrier(connection_count)
+            start = threading.Barrier(client_count)
 
-            def record(client_address, payload):
+            def append(index):
                 try:
-                    start.wait()
-                    recorder = storage.open_connection(client_address)
-                    recorder.record_received(payload)
-                    recorder.close()
-                except BaseException as error:
-                    failures.append(error)
+                    start.wait(timeout=2)
+                    storage.append_record(
+                        (f"203.0.113.{index + 10}", 5010 + index),
+                        "D1",
+                        payloads[index],
+                    )
+                except Exception as error:
+                    with failures_lock:
+                        failures.append(error)
 
             threads = [
-                threading.Thread(target=record, args=(address, payload))
-                for address, payload in payloads.items()
+                threading.Thread(target=append, args=(index,))
+                for index in range(client_count)
             ]
             for thread in threads:
                 thread.start()
             for thread in threads:
-                thread.join()
+                thread.join(timeout=2)
 
-            events = [
-                json.loads(line)
-                for line in (Path(directory) / "events.jsonl").read_text(
-                    encoding="utf-8"
-                ).splitlines()
-            ]
-            connection_files = list((Path(directory) / "connections").glob("*.bin"))
-
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
             self.assertEqual([], failures)
-            self.assertEqual(connection_count * 2, len(events))
-            self.assertEqual(connection_count, len(connection_files))
+            storage.close_all_sessions()
+            session_files = list((Path(directory) / "devices").glob("**/*.jsonl"))
+            self.assertEqual(1, len(session_files))
+            content = session_files[0].read_bytes()
+            self.assertEqual(set(payloads), set(content.splitlines(keepends=True)))
+            self.assertEqual(client_count, len(content.splitlines(keepends=True)))
 
+            closed_events = [
+                event
+                for event in self._read_events(directory)
+                if event["event"] == "session_closed"
+            ]
+
+        self.assertEqual(1, len(closed_events))
+        self.assertEqual(len(content), closed_events[0]["total_bytes"])
+        self.assertEqual("D1", closed_events[0]["device_id"])
+        self.assertEqual(
+            f"devices/{session_files[0].parent.name}/{session_files[0].name}",
+            closed_events[0]["file"],
+        )
+
+    def test_rejected_record_only_writes_a_diagnostic_event(self):
+        clock = MutableUtcClock(datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc))
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(directory, clock=clock)
+            storage.record_rejected(("203.0.113.7", 5007), "invalid_json")
+
+            devices_directory = Path(directory) / "devices"
+            self.assertFalse(devices_directory.exists())
+            events = self._read_events(directory)
+
+        self.assertEqual(1, len(events))
+        self.assertEqual("record_rejected", events[0]["event"])
+        self.assertEqual("2026-08-10T12:00:00Z", events[0]["time"])
+        self.assertEqual("invalid_json", events[0]["reason"])
+        self.assertEqual("203.0.113.7", events[0]["client_ip"])
+        self.assertEqual(5007, events[0]["client_port"])
+
+    def test_expires_session_at_idle_timeout_boundary_and_removes_it_from_active_sessions(self):
+        clock = MutableUtcClock(datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc))
+        raw_line = b'{"deviceId":"D1"}\n'
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(directory, clock=clock)
+            first_session = storage.append_record(
+                ("203.0.113.8", 5008), "D1", raw_line
+            )
+            clock.advance(30)
+            storage.expire_sessions(idle_timeout_seconds=30)
+            events_after_expiry = self._read_events(directory)
+            second_line = b'{"deviceId":"D1","n":2}\n'
+            second_session = storage.append_record(
+                ("203.0.113.8", 5008), "D1", second_line
+            )
+            storage.close_all_sessions()
+            events = self._read_events(directory)
+            session_files = list((Path(directory) / "devices").glob("**/*.jsonl"))
+            first_content = (Path(directory) / first_session.relative_path).read_bytes()
+            second_content = (
+                Path(directory) / second_session.relative_path
+            ).read_bytes()
             events_by_file = {}
             for event in events:
                 events_by_file.setdefault(event["file"], []).append(event)
 
-            self.assertEqual(
-                {f"connections/{path.name}" for path in connection_files},
-                set(events_by_file),
+        self.assertEqual(
+            [
+                "session_started",
+                "session_attached",
+                "session_idle_timeout",
+                "session_closed",
+                "session_started",
+                "session_attached",
+                "session_closed",
+            ],
+            [event["event"] for event in events],
+        )
+        self.assertNotEqual(first_session.relative_path, second_session.relative_path)
+        self.assertEqual(2, len(session_files))
+        self.assertEqual(raw_line, first_content)
+        self.assertEqual(second_line, second_content)
+        self.assertEqual(
+            [
+                "session_started",
+                "session_attached",
+                "session_idle_timeout",
+                "session_closed",
+            ],
+            [event["event"] for event in events_by_file[first_session.relative_path]],
+        )
+        self.assertEqual(
+            ["session_started", "session_attached", "session_closed"],
+            [event["event"] for event in events_by_file[second_session.relative_path]],
+        )
+        self.assertEqual(
+            ["session_started", "session_attached", "session_idle_timeout", "session_closed"],
+            [event["event"] for event in events_after_expiry],
+        )
+        self.assertEqual("2026-08-10T12:00:30Z", events[2]["time"])
+        self.assertEqual("2026-08-10T12:00:30Z", events[3]["time"])
+        for event in events[2:4]:
+            self.assertEqual(first_session.relative_path, event["file"])
+            self.assertEqual("D1", event["device_id"])
+            self.assertEqual(len(raw_line), event["total_bytes"])
+        self.assertEqual(30, events[2]["idle_timeout_seconds"])
+        self.assertEqual(second_session.relative_path, events[-1]["file"])
+        self.assertEqual(len(second_line), events[-1]["total_bytes"])
+        self.assertEqual("D1", events[-1]["device_id"])
+
+    def test_close_all_sessions_closes_each_active_session_only_once_for_shutdown(self):
+        clock = MutableUtcClock(datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc))
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(directory, clock=clock)
+            first = storage.append_record(
+                ("203.0.113.9", 5009), "D1", b'{"deviceId":"D1"}\n'
             )
-            self.assertEqual(
-                set(payloads.values()),
-                {(Path(directory) / file).read_bytes() for file in events_by_file},
+            second = storage.append_record(
+                ("203.0.113.10", 5010), "D2", b'{"deviceId":"D2"}\n'
             )
-            for file, file_events in events_by_file.items():
-                self.assertEqual(
-                    ["connected", "disconnected"],
-                    [event["event"] for event in file_events],
-                )
-                self.assertEqual(2, len(file_events))
-                self.assertEqual(
-                    file_events[-1]["total_bytes"],
-                    len((Path(directory) / file).read_bytes()),
-                )
+            storage.close_all_sessions()
+            storage.close_all_sessions()
+            closed_events = [
+                event
+                for event in self._read_events(directory)
+                if event["event"] == "session_closed"
+            ]
+
+        self.assertEqual(2, len(closed_events))
+        self.assertEqual(
+            {first.relative_path, second.relative_path},
+            {event["file"] for event in closed_events},
+        )
+        self.assertEqual({"D1", "D2"}, {event["device_id"] for event in closed_events})
+        self.assertEqual(
+            {"server_shutdown"}, {event["reason"] for event in closed_events}
+        )
+
+    @staticmethod
+    def _read_events(directory):
+        return [
+            json.loads(line)
+            for line in (Path(directory) / "events.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()
+        ]
 
 
 if __name__ == "__main__":
