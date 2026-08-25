@@ -279,6 +279,45 @@ class CollectorServerTest(unittest.TestCase):
             [event["reason"] for event in rejection_events],
         )
 
+    def test_abandons_a_recorder_when_its_first_rejected_write_fails(self):
+        storage = self._server.storage
+        original_open = storage.open_rejected_connection
+        recorders = []
+
+        def open_rejected_connection(client_address):
+            recorder = original_open(client_address)
+            recorder.record_rejected = mock.Mock(
+                side_effect=OSError("rejected record write failed")
+            )
+            recorders.append(recorder)
+            return recorder
+
+        try:
+            with mock.patch.object(
+                storage,
+                "open_rejected_connection",
+                side_effect=open_rejected_connection,
+            ), mock.patch("data_record_server.server.LOGGER.exception") as log_exception:
+                with socket.create_connection(
+                    self._server.server_address, timeout=2
+                ) as client:
+                    client.sendall(b"not-json\n")
+                    client.shutdown(socket.SHUT_WR)
+                    self.assertEqual(b"", client.recv(1))
+
+            self._wait_for(lambda: len(recorders) == 1)
+            recorder = recorders[0]
+            self.assertTrue(recorder._stream.closed)
+            self.assertNotIn(recorder.relative_path, storage._active_rejected_paths)
+            self.assertEqual(
+                ["rejected_connection_started"],
+                [event["event"] for event in self._read_events()],
+            )
+            log_exception.assert_called_once()
+        finally:
+            for recorder in recorders:
+                recorder.abandon()
+
     def test_rejects_an_incomplete_record_at_end_of_stream(self):
         with socket.create_connection(self._server.server_address, timeout=2) as client:
             client.sendall(b'{"deviceId":"D1"')

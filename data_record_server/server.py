@@ -66,12 +66,30 @@ class CollectorRequestHandler(socketserver.BaseRequestHandler):
             self.server.storage.append_record(
                 self.client_address, record.device_id, record.raw_line
             )
-        for rejection in result.rejections:
-            if rejected_recorder is None:
-                rejected_recorder = self.server.storage.open_rejected_connection(
-                    self.client_address
-                )
-            rejected_recorder.record_rejected(rejection.reason, rejection.raw_bytes)
+        recorder_created = False
+        recorded_rejection = False
+        try:
+            for rejection in result.rejections:
+                if rejected_recorder is None:
+                    rejected_recorder = self.server.storage.open_rejected_connection(
+                        self.client_address
+                    )
+                    recorder_created = True
+                rejected_recorder.record_rejected(rejection.reason, rejection.raw_bytes)
+                recorded_rejection = True
+        except BaseException:
+            if recorder_created:
+                try:
+                    if recorded_rejection:
+                        rejected_recorder.close("handler_error")
+                    else:
+                        rejected_recorder.abandon()
+                except BaseException:
+                    LOGGER.exception(
+                        "Failed while releasing rejected client connection from %s",
+                        self.client_address,
+                    )
+            raise
         return rejected_recorder
 
     def _finish_stream(self, parser: JsonlStreamParser, rejected_recorder):
