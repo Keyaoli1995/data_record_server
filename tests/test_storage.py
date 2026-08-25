@@ -375,6 +375,31 @@ class StorageTest(unittest.TestCase):
         second_stream.close.assert_called_once_with()
         self.assertNotEqual(second.relative_path, replacement.relative_path)
 
+    def test_close_all_preserves_sessions_when_the_clock_fails(self):
+        clock = MutableUtcClock(datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc))
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(directory, clock=clock)
+            session = storage.append_record(
+                ("203.0.113.15", 5015), "D1", b'{"deviceId":"D1"}\n'
+            )
+
+            def fail_clock():
+                raise OSError("clock failed")
+
+            storage._clock = fail_clock
+            with self.assertRaisesRegex(OSError, "clock failed"):
+                storage.close_all_sessions()
+
+            self.assertIs(session, storage._sessions["D1"])
+            self.assertFalse(session._closed)
+            storage._clock = clock
+            storage.close_all_sessions()
+            events = self._read_events(directory)
+
+        self.assertEqual("session_closed", events[-1]["event"])
+        self.assertEqual("server_shutdown", events[-1]["reason"])
+
     @staticmethod
     def _read_events(directory):
         return [

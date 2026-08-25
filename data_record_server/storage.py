@@ -214,16 +214,17 @@ class Storage:
 
     def close_all_sessions(self) -> None:
         """Close every active session once as part of server shutdown."""
+        closed_at = self._clock()
+        first_error = None  # type: Optional[BaseException]
         with self._sessions_lock:
             sessions = tuple(self._sessions.values())
+            for session in sessions:
+                try:
+                    session.close("server_shutdown", closed_at)
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
             self._sessions.clear()
-        first_error = None  # type: Optional[BaseException]
-        for session in sessions:
-            try:
-                session.close("server_shutdown", self._clock())
-            except BaseException as error:
-                if first_error is None:
-                    first_error = error
         if first_error is not None:
             raise first_error
 
