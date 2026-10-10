@@ -1,5 +1,10 @@
 # 拒绝记录连接归档与保留期设计
 
+> 后续变更：设备归档与拒绝连接 `.bin` 的保留期已拆分，默认分别为 365 天与 30 天，并各自写入
+> `device_retention_cleanup` / `connection_retention_cleanup` 事件。当前行为以
+> [README.md](../../../README.md) 与 [CAPABILITIES.md](../../../CAPABILITIES.md) 为准；本文保留
+> 当时单一 `RETENTION_DAYS` 的决策记录。
+
 ## 背景与目标
 
 设备采集流以 JSON Lines（JSONL）为正常协议。当前服务会将有效记录按 `deviceId` 写入设备会话归档，并仅为无效记录写入 `record_rejected` 诊断事件。由于诊断事件不保存原始字节，现场无法复原导致解析失败的实际报文。

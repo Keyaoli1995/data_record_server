@@ -371,10 +371,13 @@ class Storage:
             raise first_error
 
     def cleanup_expired_files(
-        self, retention_days: int, now: datetime, trigger: str
+        self,
+        device_retention_days: int,
+        connection_retention_days: int,
+        now: datetime,
+        trigger: str,
     ) -> None:
-        """Remove inactive archive files older than the retention period."""
-        cutoff = now.timestamp() - retention_days * 86400
+        """Remove inactive archives per archive kind's own retention period."""
         with self._sessions_lock:
             active_session_paths = {
                 session.relative_path for session in self._sessions.values()
@@ -382,11 +385,91 @@ class Storage:
         with self._rejected_paths_lock:
             active_paths = active_session_paths | set(self._active_rejected_paths)
 
+        self._cleanup_device_archives(device_retention_days, now, trigger, active_paths)
+        self._cleanup_connection_archives(
+            connection_retention_days, now, trigger, active_paths
+        )
+
+    def _cleanup_device_archives(
+        self,
+        retention_days: int,
+        now: datetime,
+        trigger: str,
+        active_paths: Set[str],
+    ) -> None:
+        """Remove expired device JSONL archives and the directories they empty."""
+        cutoff = now.timestamp() - retention_days * 86400
+        deleted_files, reclaimed_bytes, failed_files = self._unlink_expired_files(
+            self._device_archive_paths(), active_paths, cutoff, self._data_dir
+        )
+
+        for directory in self._device_directories():
+            try:
+                if stat.S_ISDIR(directory.lstat().st_mode):
+                    directory.rmdir()
+            except OSError:
+                pass
+
+        self._write_cleanup_event(
+            "device_retention_cleanup",
+            now,
+            trigger,
+            deleted_files,
+            reclaimed_bytes,
+            failed_files,
+        )
+
+    def _cleanup_connection_archives(
+        self,
+        retention_days: int,
+        now: datetime,
+        trigger: str,
+        active_paths: Set[str],
+    ) -> None:
+        """Remove expired rejected connection diagnostics."""
+        cutoff = now.timestamp() - retention_days * 86400
+        deleted_files, reclaimed_bytes, failed_files = self._unlink_expired_files(
+            self._connection_archive_paths(), active_paths, cutoff, self._data_dir
+        )
+        self._write_cleanup_event(
+            "connection_retention_cleanup",
+            now,
+            trigger,
+            deleted_files,
+            reclaimed_bytes,
+            failed_files,
+        )
+
+    def _write_cleanup_event(
+        self,
+        event: str,
+        now: datetime,
+        trigger: str,
+        deleted_files: int,
+        reclaimed_bytes: int,
+        failed_files: int,
+    ) -> None:
+        self._events.write(
+            {
+                "event": event,
+                "time": format_time(now),
+                "trigger": trigger,
+                "deleted_files": deleted_files,
+                "reclaimed_bytes": reclaimed_bytes,
+                "failed_files": failed_files,
+            }
+        )
+
+    @staticmethod
+    def _unlink_expired_files(
+        paths, active_paths: Set[str], cutoff: float, data_dir: Path
+    ) -> Tuple[int, int, int]:
+        """Unlink inactive regular files whose modification time precedes the cutoff."""
         deleted_files = 0
         reclaimed_bytes = 0
         failed_files = 0
-        for path in self._expired_archive_paths():
-            relative_path = path.relative_to(self._data_dir).as_posix()
+        for path in paths:
+            relative_path = path.relative_to(data_dir).as_posix()
             if relative_path in active_paths:
                 continue
             try:
@@ -401,24 +484,20 @@ class Storage:
                 continue
             deleted_files += 1
             reclaimed_bytes += file_status.st_size
+        return deleted_files, reclaimed_bytes, failed_files
 
+    def _device_archive_paths(self):
         for directory in self._device_directories():
             try:
                 if stat.S_ISDIR(directory.lstat().st_mode):
-                    directory.rmdir()
+                    yield from directory.glob("*.jsonl")
             except OSError:
-                pass
+                continue
 
-        self._events.write(
-            {
-                "event": "retention_cleanup",
-                "time": format_time(now),
-                "trigger": trigger,
-                "deleted_files": deleted_files,
-                "reclaimed_bytes": reclaimed_bytes,
-                "failed_files": failed_files,
-            }
-        )
+    def _connection_archive_paths(self):
+        connections_directory = self._data_dir / "connections"
+        if self._is_real_directory(connections_directory):
+            yield from connections_directory.glob("*.bin")
 
     def _create_session(self, device_id: str) -> DeviceSession:
         escaped_device_id = quote_from_bytes(
@@ -468,17 +547,6 @@ class Storage:
         """Remove a closed diagnostic file from the cleanup exclusion set."""
         with self._rejected_paths_lock:
             self._active_rejected_paths.discard(relative_path)
-
-    def _expired_archive_paths(self):
-        connections_directory = self._data_dir / "connections"
-        if self._is_real_directory(connections_directory):
-            yield from connections_directory.glob("*.bin")
-        for directory in self._device_directories():
-            try:
-                if stat.S_ISDIR(directory.lstat().st_mode):
-                    yield from directory.glob("*.jsonl")
-            except OSError:
-                continue
 
     def _device_directories(self):
         devices_directory = self._data_dir / "devices"

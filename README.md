@@ -25,7 +25,8 @@
 | `READ_BUFFER_BYTES` | `4096` | 单次 socket 读取块大小，不是 JSONL 行长度限制。 |
 | `IDLE_TIMEOUT_SECONDS` | `30` | 从最后一条有效记录开始计算的设备会话空闲秒数。 |
 | `MAX_JSON_LINE_BYTES` | `65536` | 单条 JSONL 内容（不含换行符）的最大字节数；超出时记录 `record_rejected` 并关闭该 TCP 连接。 |
-| `RETENTION_DAYS` | `30` | 非活跃设备 JSONL 归档和拒绝连接 `.bin` 的保留天数。 |
+| `DEVICE_RETENTION_DAYS` | `365` | 非活跃设备 JSONL 归档（`data/devices/**/*.jsonl`）的保留天数。 |
+| `RETENTION_DAYS` | `30` | 非活跃拒绝连接 `.bin`（`data/connections/*.bin`）的保留天数；不影响设备归档。 |
 | `COLLECTOR_UID` / `COLLECTOR_GID` | `10001` / `10001` | 容器非 root 运行身份与 bind mount 所有者。 |
 
 可选的 `.env`（不要提交）示例：
@@ -36,6 +37,7 @@ COLLECTOR_GID=1000
 TCP_PORT=30100
 IDLE_TIMEOUT_SECONDS=45
 MAX_JSON_LINE_BYTES=65536
+DEVICE_RETENTION_DAYS=365
 RETENTION_DAYS=30
 ```
 
@@ -114,9 +116,9 @@ fi
 | `rejected_connection_closed` | 拒绝连接已关闭；`file` 指向该连接 `.bin`。 |
 | `session_idle_timeout` | 从最后一条有效记录起达到空闲超时。 |
 | `session_closed` | 会话文件已关闭；原因可能是空闲超时或服务停止。 |
-| `retention_cleanup` | 已执行归档清理；包含触发原因、删除文件数、回收字节数和失败数。 |
+| `device_retention_cleanup` / `connection_retention_cleanup` | 已按归档类型执行清理；分别记录各自的删除文件数、回收字节数和失败数。 |
 
-服务启动后会立即执行一次清理，之后每天服务器本地时间跨越 `00:00` 时再执行一次。它只删除超过 `RETENTION_DAYS` 的非活跃 `data/devices/**/*.jsonl` 和 `data/connections/*.bin`，并会移除清空的设备目录；活跃文件及 `data/events.jsonl` 不会被删除。
+服务启动后会立即执行一次清理，之后每天服务器本地时间跨越 `00:00` 时再执行一次。清理按归档类型分别判定：超过 `DEVICE_RETENTION_DAYS`（默认 365 天）的非活跃 `data/devices/**/*.jsonl`，以及超过 `RETENTION_DAYS`（默认 30 天）的非活跃 `data/connections/*.bin`；删除设备归档后会移除清空的设备目录。活跃文件及 `data/events.jsonl` 不会被删除。两类归档各自写出一条 `*_retention_cleanup` 事件。
 
 ## 备份与排障
 

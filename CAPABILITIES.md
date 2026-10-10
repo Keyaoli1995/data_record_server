@@ -19,8 +19,8 @@
 ### 拒绝连接诊断归档与保留清理
 
 - 每个出现拒绝记录的 TCP 连接都会创建一个 `data/connections/*.bin`，同一连接的全部拒绝原始字节按接收顺序追加到同一个文件。
-- `RETENTION_DAYS` 默认 `30`；服务启动后清理一次，之后每当服务器本地时间跨越 `00:00` 清理一次。清理只删除超过保留期的非活跃 `data/devices/**/*.jsonl` 和 `data/connections/*.bin`，并会删除清空的设备目录。
-- `data/events.jsonl` 是诊断日志，不受保留清理删除；`retention_cleanup` 事件记录每次清理的触发原因和统计数据。
+- 保留期按归档类型独立配置：`DEVICE_RETENTION_DAYS` 默认 `365` 管设备归档，`RETENTION_DAYS` 默认 `30` 管拒绝连接 `.bin`。服务启动后清理一次，之后每当服务器本地时间跨越 `00:00` 清理一次；只删除超过各自保留期的非活跃文件，并会删除清空的设备目录。
+- `data/events.jsonl` 是诊断日志，不受保留清理删除；`device_retention_cleanup` 与 `connection_retention_cleanup` 事件分别记录每次清理的触发原因和统计数据。
 
 ### 生命周期与诊断
 
@@ -35,7 +35,8 @@
 | `rejected_connection_closed` | `time`、`file`、`total_bytes`、`reason` | 拒绝连接诊断归档已关闭。 |
 | `session_idle_timeout` | `time`、`file`、`device_id`、`idle_timeout_seconds`、`total_bytes` | 会话自最后有效记录起空闲到期。 |
 | `session_closed` | `time`、`file`、`device_id`、`total_bytes`、`reason` | 会话已关闭。 |
-| `retention_cleanup` | `time`、`trigger`、`deleted_files`、`reclaimed_bytes`、`failed_files` | 已完成一次保留清理。 |
+| `device_retention_cleanup` | `time`、`trigger`、`deleted_files`、`reclaimed_bytes`、`failed_files` | 已完成一次设备归档保留清理。 |
+| `connection_retention_cleanup` | `time`、`trigger`、`deleted_files`、`reclaimed_bytes`、`failed_files` | 已完成一次拒绝连接归档保留清理。 |
 
 ### 安全运行
 

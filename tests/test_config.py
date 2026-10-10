@@ -28,22 +28,45 @@ class ConfigTest(unittest.TestCase):
 
         self.assertEqual(65536, config.max_json_line_bytes)
 
-    def test_uses_a_30_day_retention_period_by_default(self):
+    def test_uses_a_one_year_device_retention_period_by_default(self):
         with patch.dict(os.environ, {}, clear=True):
             config = Config.from_environ()
 
-        self.assertEqual(30, config.retention_days)
+        self.assertEqual(365, config.device_retention_days)
 
-    def test_uses_retention_days_environment_override(self):
+    def test_uses_a_30_day_connection_retention_period_by_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            config = Config.from_environ()
+
+        self.assertEqual(30, config.connection_retention_days)
+
+    def test_uses_device_retention_days_environment_override(self):
+        config = Config.from_environ({"DEVICE_RETENTION_DAYS": "730"})
+
+        self.assertEqual(730, config.device_retention_days)
+
+    def test_rejects_non_positive_device_retention_days(self):
+        for value in ("0", "-1", "not-a-number"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "DEVICE_RETENTION_DAYS"):
+                    Config.from_environ({"DEVICE_RETENTION_DAYS": value})
+
+    def test_uses_connection_retention_days_environment_override(self):
         config = Config.from_environ({"RETENTION_DAYS": "45"})
 
-        self.assertEqual(45, config.retention_days)
+        self.assertEqual(45, config.connection_retention_days)
 
-    def test_rejects_non_positive_retention_days(self):
+    def test_rejects_non_positive_connection_retention_days(self):
         for value in ("0", "-1", "not-a-number"):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(ValueError, "RETENTION_DAYS"):
                     Config.from_environ({"RETENTION_DAYS": value})
+
+    def test_connection_retention_does_not_affect_device_retention(self):
+        config = Config.from_environ({"RETENTION_DAYS": "7"})
+
+        self.assertEqual(7, config.connection_retention_days)
+        self.assertEqual(365, config.device_retention_days)
 
     def test_uses_idle_timeout_environment_override(self):
         config = Config.from_environ({"IDLE_TIMEOUT_SECONDS": "45"})

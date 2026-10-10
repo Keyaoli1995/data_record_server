@@ -44,6 +44,7 @@ COLLECTOR_GID=1000
 TCP_PORT=30100
 IDLE_TIMEOUT_SECONDS=45
 MAX_JSON_LINE_BYTES=65536
+DEVICE_RETENTION_DAYS=365
 RETENTION_DAYS=30
 ```
 
@@ -55,7 +56,7 @@ docker compose config --quiet
 docker compose up -d --build
 ```
 
-`MAX_JSON_LINE_BYTES` 默认 `65536`，是单条 JSONL 内容（不含换行符）的上限；它不同于 `READ_BUFFER_BYTES` 的 socket 读取块大小。`RETENTION_DAYS` 默认 `30`，用于清理非活跃归档。所有数值应为正整数，端口必须在 `1` 至 `65535`。Compose 会将宿主机 `/etc/localtime` 只读挂载到容器，使清理时间与服务器本地时区一致。
+`MAX_JSON_LINE_BYTES` 默认 `65536`，是单条 JSONL 内容（不含换行符）的上限；它不同于 `READ_BUFFER_BYTES` 的 socket 读取块大小。`DEVICE_RETENTION_DAYS` 默认 `365`，用于清理非活跃设备归档；`RETENTION_DAYS` 默认 `30`，仅用于清理非活跃拒绝连接 `.bin`。所有数值应为正整数，端口必须在 `1` 至 `65535`。Compose 会将宿主机 `/etc/localtime` 只读挂载到容器，使清理时间与服务器本地时区一致。
 
 ## 网络放行
 
@@ -129,6 +130,6 @@ docker compose restart collector
 docker compose down
 ```
 
-`data/` 是 bind mount，重启、停止或重建容器不会删除 `data/devices/`、`data/connections/` 或 `events.jsonl`。服务启动后立即清理一次，随后每天服务器本地时间跨越 `00:00` 时清理一次：删除超过 `RETENTION_DAYS` 的非活跃 `devices/**/*.jsonl` 与 `connections/*.bin`，并记录 `retention_cleanup` 事件。`events.jsonl` 永不由该清理任务删除。拒绝连接 `.bin` 没有单连接大小上限，仍须监控磁盘使用量并按需要备份。
+`data/` 是 bind mount，重启、停止或重建容器不会删除 `data/devices/`、`data/connections/` 或 `events.jsonl`。服务启动后立即清理一次，随后每天服务器本地时间跨越 `00:00` 时清理一次：删除超过 `DEVICE_RETENTION_DAYS` 的非活跃 `devices/**/*.jsonl`，以及超过 `RETENTION_DAYS` 的非活跃 `connections/*.bin`，并分别记录 `device_retention_cleanup` 与 `connection_retention_cleanup` 事件。`events.jsonl` 永不由该清理任务删除。拒绝连接 `.bin` 没有单连接大小上限，仍须监控磁盘使用量并按需要备份。
 
 若日志出现 `Permission denied`，执行 `docker compose down`，再以 Compose 使用的同一 UID/GID 运行 `scripts/prepare-data-dir.sh` 后重新启动。若客户端得到 `connection refused`，依次检查 `docker compose ps`、服务日志、`docker compose port` 及安全组/防火墙的来源 IP 和端口。

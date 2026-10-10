@@ -102,6 +102,7 @@ class DeploymentFilesTest(unittest.TestCase):
                 "READ_BUFFER_BYTES": "${READ_BUFFER_BYTES:-4096}",
                 "IDLE_TIMEOUT_SECONDS": "${IDLE_TIMEOUT_SECONDS:-30}",
                 "MAX_JSON_LINE_BYTES": "${MAX_JSON_LINE_BYTES:-65536}",
+                "DEVICE_RETENTION_DAYS": "${DEVICE_RETENTION_DAYS:-365}",
                 "RETENTION_DAYS": "${RETENTION_DAYS:-30}",
             },
             collector["environment"],

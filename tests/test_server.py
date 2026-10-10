@@ -77,7 +77,8 @@ class CollectorServerTest(unittest.TestCase):
             server_address=("127.0.0.1", 0),
             storage=storage,
             read_buffer_bytes=4,
-            retention_days=14,
+            device_retention_days=365,
+            connection_retention_days=14,
             local_clock=local_clock,
         )
         try:
@@ -90,8 +91,8 @@ class CollectorServerTest(unittest.TestCase):
 
         self.assertEqual(
             [
-                mock.call(14, local_clock.history[0], "startup"),
-                mock.call(14, local_clock.history[2], "midnight"),
+                mock.call(365, 14, local_clock.history[0], "startup"),
+                mock.call(365, 14, local_clock.history[2], "midnight"),
             ],
             storage.cleanup_expired_files.call_args_list,
         )
@@ -99,10 +100,18 @@ class CollectorServerTest(unittest.TestCase):
 
     def test_create_server_uses_configured_retention_days(self):
         server = create_server(
-            Config("127.0.0.1", 0, self._data_dir, 4, retention_days=14)
+            Config(
+                "127.0.0.1",
+                0,
+                self._data_dir,
+                4,
+                device_retention_days=365,
+                connection_retention_days=14,
+            )
         )
         try:
-            self.assertEqual(14, server.retention_days)
+            self.assertEqual(365, server.device_retention_days)
+            self.assertEqual(14, server.connection_retention_days)
         finally:
             server.server_close()
 

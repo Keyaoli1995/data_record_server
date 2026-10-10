@@ -34,10 +34,12 @@ class StorageTest(unittest.TestCase):
             stale_connection = data_dir / "connections" / "stale.bin"
             fresh_connection = data_dir / "connections" / "fresh.bin"
             stale_device_file = data_dir / "devices" / "device-D1" / "stale.jsonl"
+            retained_device_file = data_dir / "devices" / "device-D1" / "fresh.jsonl"
             for path, contents, age_days in (
                 (stale_connection, b"old", 31),
                 (fresh_connection, b"new", 1),
-                (stale_device_file, b"archive", 31),
+                (stale_device_file, b"archive", 366),
+                (retained_device_file, b"recent", 31),
             ):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(contents)
@@ -45,24 +47,110 @@ class StorageTest(unittest.TestCase):
                 os.utime(path, (timestamp, timestamp))
 
             storage = Storage(data_dir)
-            storage.cleanup_expired_files(30, now, "startup")
-            events = self._read_events(data_dir)
+            storage.cleanup_expired_files(
+                device_retention_days=365,
+                connection_retention_days=30,
+                now=now,
+                trigger="startup",
+            )
+            cleanup_events = self._cleanup_events(data_dir)
 
             self.assertFalse(stale_connection.exists())
             self.assertTrue(fresh_connection.exists())
             self.assertFalse(stale_device_file.exists())
-            self.assertFalse((data_dir / "devices" / "device-D1").exists())
+            self.assertTrue(retained_device_file.exists())
+            self.assertTrue((data_dir / "devices" / "device-D1").exists())
 
         self.assertEqual(
             {
-                "event": "retention_cleanup",
+                "event": "device_retention_cleanup",
                 "time": "2026-08-10T12:00:00Z",
                 "trigger": "startup",
-                "deleted_files": 2,
-                "reclaimed_bytes": 10,
+                "deleted_files": 1,
+                "reclaimed_bytes": 7,
                 "failed_files": 0,
             },
-            events[-1],
+            cleanup_events["device_retention_cleanup"],
+        )
+        self.assertEqual(
+            {
+                "event": "connection_retention_cleanup",
+                "time": "2026-08-10T12:00:00Z",
+                "trigger": "startup",
+                "deleted_files": 1,
+                "reclaimed_bytes": 3,
+                "failed_files": 0,
+            },
+            cleanup_events["connection_retention_cleanup"],
+        )
+
+    def test_cleanup_keeps_device_archives_that_the_connection_retention_would_delete(
+        self,
+    ):
+        now = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            device_file = data_dir / "devices" / "device-D1" / "recent.jsonl"
+            device_file.parent.mkdir(parents=True)
+            device_file.write_bytes(b"archive")
+            timestamp = (now - timedelta(days=90)).timestamp()
+            os.utime(device_file, (timestamp, timestamp))
+
+            storage = Storage(data_dir)
+            storage.cleanup_expired_files(
+                device_retention_days=365,
+                connection_retention_days=30,
+                now=now,
+                trigger="startup",
+            )
+            cleanup_events = self._cleanup_events(data_dir)
+
+            self.assertTrue(device_file.exists())
+
+        self.assertEqual(0, cleanup_events["device_retention_cleanup"]["deleted_files"])
+        self.assertEqual(
+            0, cleanup_events["device_retention_cleanup"]["reclaimed_bytes"]
+        )
+
+    def test_connection_cleanup_uses_its_own_retention_period(self):
+        now = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            connection = data_dir / "connections" / "stale.bin"
+            connection.parent.mkdir(parents=True)
+            connection.write_bytes(b"rejected")
+            device_file = data_dir / "devices" / "device-D1" / "stale.jsonl"
+            device_file.parent.mkdir(parents=True)
+            device_file.write_bytes(b"archive")
+            for path, age_days in ((connection, 45), (device_file, 400)):
+                timestamp = (now - timedelta(days=age_days)).timestamp()
+                os.utime(path, (timestamp, timestamp))
+
+            storage = Storage(data_dir)
+            storage.cleanup_expired_files(
+                device_retention_days=365,
+                connection_retention_days=30,
+                now=now,
+                trigger="startup",
+            )
+            cleanup_events = self._cleanup_events(data_dir)
+
+            self.assertFalse(connection.exists())
+            self.assertFalse(device_file.exists())
+
+        self.assertEqual(
+            8, cleanup_events["connection_retention_cleanup"]["reclaimed_bytes"]
+        )
+        self.assertEqual(
+            1, cleanup_events["connection_retention_cleanup"]["deleted_files"]
+        )
+        self.assertEqual(
+            7, cleanup_events["device_retention_cleanup"]["reclaimed_bytes"]
+        )
+        self.assertEqual(
+            1, cleanup_events["device_retention_cleanup"]["deleted_files"]
         )
 
     def test_cleanup_skips_active_archives_and_symbolic_links(self):
@@ -92,8 +180,13 @@ class StorageTest(unittest.TestCase):
                 follow_symlinks=False,
             )
 
-            storage.cleanup_expired_files(30, now, "startup")
-            cleanup_event = self._read_events(data_dir)[-1]
+            storage.cleanup_expired_files(
+                device_retention_days=30,
+                connection_retention_days=30,
+                now=now,
+                trigger="startup",
+            )
+            cleanup_events = self._read_events(data_dir)[-2:]
             rejected.close("eof")
             storage.close_all_sessions()
 
@@ -102,9 +195,10 @@ class StorageTest(unittest.TestCase):
             self.assertTrue(symlink.is_symlink())
             self.assertTrue(symlink_target.exists())
 
-        self.assertEqual(0, cleanup_event["deleted_files"])
-        self.assertEqual(0, cleanup_event["reclaimed_bytes"])
-        self.assertEqual(0, cleanup_event["failed_files"])
+        for cleanup_event in cleanup_events:
+            self.assertEqual(0, cleanup_event["deleted_files"])
+            self.assertEqual(0, cleanup_event["reclaimed_bytes"])
+            self.assertEqual(0, cleanup_event["failed_files"])
 
     def test_cleanup_does_not_follow_symbolic_linked_device_directory(self):
         now = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
@@ -123,8 +217,15 @@ class StorageTest(unittest.TestCase):
             )
 
             storage = Storage(data_dir)
-            storage.cleanup_expired_files(30, now, "startup")
-            cleanup_event = self._read_events(data_dir)[-1]
+            storage.cleanup_expired_files(
+                device_retention_days=365,
+                connection_retention_days=30,
+                now=now,
+                trigger="startup",
+            )
+            cleanup_event = self._cleanup_events(data_dir)[
+                "device_retention_cleanup"
+            ]
 
             self.assertTrue(external_file.exists())
 
@@ -146,9 +247,19 @@ class StorageTest(unittest.TestCase):
             )
 
             storage = Storage(data_dir)
-            storage.cleanup_expired_files(30, now, "startup")
+            storage.cleanup_expired_files(
+                device_retention_days=365,
+                connection_retention_days=30,
+                now=now,
+                trigger="startup",
+            )
+            cleanup_event = self._cleanup_events(data_dir)[
+                "connection_retention_cleanup"
+            ]
 
             self.assertTrue(external_file.exists())
+
+        self.assertEqual(0, cleanup_event["deleted_files"])
 
     def test_cleanup_does_not_follow_symbolic_linked_devices_directory(self):
         now = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
@@ -166,9 +277,19 @@ class StorageTest(unittest.TestCase):
             )
 
             storage = Storage(data_dir)
-            storage.cleanup_expired_files(30, now, "startup")
+            storage.cleanup_expired_files(
+                device_retention_days=365,
+                connection_retention_days=30,
+                now=now,
+                trigger="startup",
+            )
+            cleanup_event = self._cleanup_events(data_dir)[
+                "device_retention_cleanup"
+            ]
 
             self.assertTrue(external_file.exists())
+
+        self.assertEqual(0, cleanup_event["deleted_files"])
 
     def test_merges_device_records_from_multiple_clients_into_one_jsonl_session(self):
         clock = MutableUtcClock(datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc))
@@ -668,6 +789,16 @@ class StorageTest(unittest.TestCase):
                 encoding="utf-8"
             ).splitlines()
         ]
+
+    @classmethod
+    def _cleanup_events(cls, directory):
+        """Map the latest cleanup event of each archive kind to its payload."""
+        names = {"device_retention_cleanup", "connection_retention_cleanup"}
+        cleanup_events = {}
+        for event in cls._read_events(directory):
+            if event["event"] in names:
+                cleanup_events[event["event"]] = event
+        return cleanup_events
 
 
 if __name__ == "__main__":

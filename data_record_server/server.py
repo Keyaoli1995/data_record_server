@@ -115,14 +115,16 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         read_buffer_bytes: int,
         idle_timeout_seconds: float = 30,
         max_json_line_bytes: int = 65536,
-        retention_days: int = 30,
+        device_retention_days: int = 365,
+        connection_retention_days: int = 30,
         local_clock: Optional[Callable[[], datetime]] = None,
     ) -> None:
         self.storage = storage
         self.read_buffer_bytes = read_buffer_bytes
         self.idle_timeout_seconds = idle_timeout_seconds
         self.max_json_line_bytes = max_json_line_bytes
-        self.retention_days = retention_days
+        self.device_retention_days = device_retention_days
+        self.connection_retention_days = connection_retention_days
         self._local_clock = local_now if local_clock is None else local_clock
         self._last_retention_cleanup_date = None
         self._active_requests = set()
@@ -204,7 +206,12 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         elif now.date() != self._last_retention_cleanup_date:
             trigger = "midnight"
         if trigger is not None:
-            self.storage.cleanup_expired_files(self.retention_days, now, trigger)
+            self.storage.cleanup_expired_files(
+                self.device_retention_days,
+                self.connection_retention_days,
+                now,
+                trigger,
+            )
             self._last_retention_cleanup_date = now.date()
         super().service_actions()
 
@@ -425,7 +432,8 @@ def create_server(config: Config) -> CollectorServer:
         config.read_buffer_bytes,
         config.idle_timeout_seconds,
         config.max_json_line_bytes,
-        config.retention_days,
+        config.device_retention_days,
+        config.connection_retention_days,
     )
 
 
