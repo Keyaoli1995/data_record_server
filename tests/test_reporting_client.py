@@ -85,3 +85,12 @@ class ClientTest(unittest.TestCase):
         with self.assertRaises(reporting_client.ReportError) as cm:
             reporting_client.ReportClient(self.config, send=fail).send(self.item)
         self.assertTrue(cm.exception.retryable)
+
+    def test_icd_nested_error_code_preserved_and_takes_precedence(self):
+        body={'code':40001,'msg':'arbitrary secret message','data':{'errorCode':'RakingRecordingTaskTimedOut','fileKey':'file1'}}
+        for status in (200,400,503):
+            with self.subTest(status=status), self.assertRaises(reporting_client.ReportError) as cm:
+                self.client(status=status,body=body).send(self.item)
+            self.assertEqual(cm.exception.code,'RakingRecordingTaskTimedOut')
+            self.assertFalse(cm.exception.retryable)
+            self.assertNotIn('secret',str(cm.exception))
