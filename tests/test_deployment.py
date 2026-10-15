@@ -75,6 +75,8 @@ class DeploymentFilesTest(unittest.TestCase):
             "Dockerfile must make /data writable by collector",
         )
         self.assertIn("WORKDIR /app", instructions)
+        self.assertIn("COPY requirements-reporting.txt /app/requirements-reporting.txt", instructions)
+        self.assertTrue(any("pip install" in line and "requirements-reporting.txt" in line for line in instructions))
         self.assertIn("COPY data_record_server/ /app/data_record_server/", instructions)
         self.assertIn("EXPOSE 30050", instructions)
         self.assertEqual(
@@ -104,6 +106,14 @@ class DeploymentFilesTest(unittest.TestCase):
                 "MAX_JSON_LINE_BYTES": "${MAX_JSON_LINE_BYTES:-65536}",
                 "DEVICE_RETENTION_DAYS": "${DEVICE_RETENTION_DAYS:-365}",
                 "RETENTION_DAYS": "${RETENTION_DAYS:-30}",
+                "WEB_REPORTING_ENABLED": "${WEB_REPORTING_ENABLED:-false}",
+                "WEB_BASE_URL": "${WEB_BASE_URL:-}",
+                "WEB_ENVIRONMENT": "${WEB_ENVIRONMENT:-}",
+                "WEB_AUTHORIZATION": "${WEB_AUTHORIZATION:-}",
+                "WEB_ALLOW_HTTP": "${WEB_ALLOW_HTTP:-false}",
+                "WEB_UPDATE_INTERVAL_SECONDS": "${WEB_UPDATE_INTERVAL_SECONDS:-10}",
+                "WEB_REQUEST_TIMEOUT_SECONDS": "${WEB_REQUEST_TIMEOUT_SECONDS:-5}",
+                "WEB_SHUTDOWN_REASON": "${WEB_SHUTDOWN_REASON:-SERVER_SHUTDOWN}",
             },
             collector["environment"],
         )
@@ -131,6 +141,7 @@ class DeploymentFilesTest(unittest.TestCase):
         self.assertTrue(
             {
                 ".git",
+                ".worktrees",
                 ".env",
                 "__pycache__",
                 "*.py[cod]",
