@@ -37,6 +37,7 @@ class WorksiteTimezone:
             "name": None,
             "source": "injected" if lookup is not None else "timezonefinder",
             "version": None,
+            "data_version": None,
             "location": None,
             "gps_time_ms": None,
             "conflict_count": 0,
@@ -81,7 +82,7 @@ class WorksiteTimezone:
             return self._lookup(lat, lon)
         if self._load_failed:
             return None
-        # The shared disk-backed finder saves about 9 MiB per device. Its file
+        # Share the disk-backed index across devices. Its file
         # readers use seek(), so both creation and queries must be serialized.
         with _FINDER_LOCK:
             if self._finder is None:
@@ -92,6 +93,7 @@ class WorksiteTimezone:
                         _FINDER = TimezoneFinder(in_memory=False)
                     self._finder = _FINDER
                     self._audit["version"] = version("timezonefinder")
+                    self._audit["data_version"] = version("timezonefinder-data")
                 except Exception:
                     self._load_failed = True
                     raise
