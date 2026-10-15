@@ -78,3 +78,27 @@ class ReportingLifecycleTest(unittest.TestCase):
         server.server_close()
         service=reporting_service.ReportingService(other,self.config)
         service.stop()
+
+    def test_delayed_worker_exit_eventually_releases_lease(self):
+        import threading
+        from dataclasses import replace
+        self.service.worker.config=replace(self.config,request_timeout=.01)
+        entered=threading.Event();release=threading.Event()
+        def slow():entered.set();release.wait(5)
+        self.service.worker.prepare=slow
+        self.service.start();self.assertTrue(entered.wait(2))
+        self.service.stop()
+        with self.assertRaises(RuntimeError):
+            reporting_service.ReportingService(self.root,self.config)
+        release.set()
+        self.service.worker._thread.join(3)
+        self.assertTrue(self.service.wait_stopped(3))
+        replacement=reporting_service.ReportingService(self.root,self.config)
+        replacement.stop()
+
+    def test_normal_stop_builds_final_outbox_without_http(self):
+        self.append();self.storage.close_all_sessions()
+        self.service.stop()
+        import sqlite3
+        with sqlite3.connect(self.root/'reporting/outbox.sqlite3') as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM outbox WHERE phase='close'").fetchone()[0],1)
