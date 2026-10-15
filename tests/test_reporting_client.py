@@ -78,3 +78,10 @@ class ClientTest(unittest.TestCase):
             self.client(status=503,body={'code':'RakingRecordingTaskTimedOut'}).send(self.item)
         self.assertFalse(cm.exception.retryable)
         self.assertEqual(cm.exception.code,'RakingRecordingTaskTimedOut')
+
+    def test_broken_http_response_is_retryable(self):
+        from http.client import IncompleteRead
+        def fail(*args, **kwargs): raise IncompleteRead(b'partial', 100)
+        with self.assertRaises(reporting_client.ReportError) as cm:
+            reporting_client.ReportClient(self.config, send=fail).send(self.item)
+        self.assertTrue(cm.exception.retryable)

@@ -100,3 +100,18 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(self.client.send.call_count,1)
         self.assertEqual(self.store.recordings()[0]['file_key'],row['file_key'])
         self.assertIn(row['path'],self.store.protected_paths())
+
+    def test_timezone_lock_persisted_after_initial_unknown_snapshot(self):
+        row,file=self.file(raw=b'{"deviceId":"D1","gpsTime":1000,"GNSSlat":28.2,"GNSSlon":112.8,"GNSSPosStat":"4"}\n')
+        self.worker.prepare(); self.worker.deliver();self.worker.deliver()
+        with file.open('ab') as f:
+            for gps in (2000,3000):
+                f.write((json.dumps(dict(deviceId='D1',gpsTime=gps,GNSSlat=28.2,GNSSlon=112.8,GNSSPosStat='4'))+'\n').encode())
+        self.worker.prepare();self.worker.deliver()
+        audit=json.loads(self.store.recordings()[0]['timezone_audit'])
+        self.assertEqual(audit['name'],'Asia/Shanghai')
+        self.store.mark_closed(row['path'],'IDLE_TIMEOUT',NOW.isoformat())
+        restarted=reporting_worker.ReportWorker(self.root,self.store,self.config,self.client,
+             clock=lambda:NOW,zone_factory=lambda:WorksiteTimezone(lambda lat,lon:None))
+        restarted.prepare();restarted.deliver()
+        self.assertEqual(self.client.send.call_args[0][0]['body']['timezone'],'Asia/Shanghai')
