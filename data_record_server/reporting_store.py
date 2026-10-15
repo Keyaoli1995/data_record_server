@@ -143,6 +143,10 @@ class ReportStore:
 
     def retry_blocked(self, file_key):
         with self._lock, self._db:
+            if self._db.execute("SELECT 1 FROM outbox WHERE file_key=? AND error IN ('RakingRecordingTaskTimedOut','RakingFileAlreadyFinished')", (file_key,)).fetchone():
+                raise ValueError('remote terminal task requires Web reconciliation, not ordinary retry')
+            if not self._db.execute('SELECT 1 FROM recordings WHERE file_key=?', (file_key,)).fetchone():
+                raise ValueError('unknown fileKey')
             self._db.execute("UPDATE outbox SET state='PENDING',next_at=0 WHERE file_key=? AND state='BLOCKED'", (file_key,))
 
     def protected_paths(self):
