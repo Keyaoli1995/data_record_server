@@ -63,21 +63,25 @@ class ReportClient:
         except (OSError, URLError, TimeoutError):
             # Do not persist exception messages: upstream URLs or response bodies may contain credentials.
             raise ReportError('NETWORK_ERROR', True) from None
-        if not 200 <= status < 300:
-            raise ReportError('HTTP_' + str(status), status == 429 or status >= 500, delay)
         if len(raw) > 1024 * 1024:
             raise ReportError('RESPONSE_TOO_LARGE')
         try:
             result = json.loads(raw)
         except (ValueError, UnicodeError):
-            raise ReportError('INVALID_RESPONSE') from None
-        if not isinstance(result, dict) or type(result.get('code')) is not int or result['code'] != 0:
-            # Whitelist recognized permanent business errors; never echo arbitrary server text.
-            known = {'RakingRecordingTaskTimedOut','RakingFileAlreadyFinished',
-                     'RakingUnauthorized','RakingFileValidationFailed','RakingEnvironmentMismatch',
-                     'RakingFileSequenceConflict','RakingLocatorDisabled','RakingInvalidRequest'}
-            code = result.get('code') if isinstance(result, dict) else None
-            raise ReportError(code if isinstance(code, str) and code in known else 'BUSINESS_ERROR')
+            result = None
+        # Permanent business errors take precedence even when a proxy returned 5xx.
+        known = {'RakingRecordingTaskTimedOut','RakingFileAlreadyFinished',
+                 'RakingUnauthorized','RakingFileValidationFailed','RakingEnvironmentMismatch',
+                 'RakingFileSequenceConflict','RakingLocatorDisabled','RakingInvalidRequest'}
+        code = result.get('code') if isinstance(result, dict) else None
+        if isinstance(code, str) and code in known:
+            raise ReportError(code)
+        if not 200 <= status < 300:
+            raise ReportError('HTTP_' + str(status), status == 429 or status >= 500, delay)
+        if not isinstance(result, dict):
+            raise ReportError('INVALID_RESPONSE')
+        if type(code) is not int or code != 0:
+            raise ReportError('BUSINESS_ERROR')
         data = result.get('data')
         if (not isinstance(data, dict) or data.get('fileKey') != item['file_key']
                 or data.get('rakingRecordingTaskId') != item['task_id']):

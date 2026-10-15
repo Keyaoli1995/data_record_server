@@ -13,7 +13,8 @@ def valid_gps(value):
 
 
 def gps_iso(value):
-    return datetime.fromtimestamp(value / 1000, timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+    seconds, milliseconds = divmod(value, 1000)
+    return datetime.fromtimestamp(seconds, timezone.utc).replace(microsecond=milliseconds * 1000).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def finite_number(value):
@@ -66,10 +67,10 @@ class FileStats:
             remaining = before.st_size - self._offset
             # Read only the snapshot observed on entry; active files may continue growing.
             while remaining:
-                raw = stream.readline(min(remaining, 65538))
+                raw = stream.readline(remaining)
                 if not raw:
                     raise ValueError('recording changed during scan')
-                if not raw.endswith(b'\n') and len(raw) < 65538 and not final:
+                if not raw.endswith(b'\n') and not final:
                     break
                 remaining -= len(raw)
                 self._offset += len(raw)
