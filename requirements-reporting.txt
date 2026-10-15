@@ -1,3 +1,9 @@
 # Offline timezone polygons, including historical IANA zone distinctions.
 # Python 3.12 supported; code MIT, bundled boundary data ODbL-1.0.
 timezonefinder==6.5.9
+# Reproducible Python 3.12 runtime dependencies (no optional numba/JIT).
+cffi==1.17.1
+h3==4.5.0
+numpy==2.5.4
+pycparser==3.11
+tzdata==2026.5

@@ -19,6 +19,9 @@ RUN groupadd --gid "${COLLECTOR_GID}" collector \
         --shell /usr/sbin/nologin collector \
     && install -d --owner=collector --group=collector /data
 
+COPY requirements-reporting.txt /app/requirements-reporting.txt
+RUN pip install --no-cache-dir -r /app/requirements-reporting.txt
+
 COPY data_record_server/ /app/data_record_server/
 
 EXPOSE 30050
