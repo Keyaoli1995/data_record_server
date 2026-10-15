@@ -6,6 +6,7 @@ Only local transactions run under the lock. Never hold it during HTTP or file sc
 import json
 import sqlite3
 import threading
+import time
 import uuid
 from pathlib import Path, PurePosixPath
 
@@ -40,9 +41,12 @@ class ReportStore:
                     id INTEGER PRIMARY KEY, file_key TEXT NOT NULL, phase TEXT NOT NULL,
                     key TEXT NOT NULL UNIQUE, body TEXT NOT NULL,
                     state TEXT NOT NULL DEFAULT 'PENDING', attempts INTEGER NOT NULL DEFAULT 0,
-                    next_at REAL NOT NULL DEFAULT 0, error TEXT);
+                    next_at REAL NOT NULL DEFAULT 0, error TEXT, created_at REAL NOT NULL DEFAULT 0);
                 CREATE INDEX IF NOT EXISTS outbox_file_order ON outbox(file_key,id,state);
             ''')
+            columns = {row[1] for row in self._db.execute('PRAGMA table_info(outbox)')}
+            if 'created_at' not in columns:
+                self._db.execute('ALTER TABLE outbox ADD COLUMN created_at REAL NOT NULL DEFAULT 0')
             with self._db:
                 for key, value in (('environment', environment), ('origin', origin), ('schema', '1')):
                     old = self._db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
@@ -76,9 +80,9 @@ class ReportStore:
             return dict(self._db.execute('SELECT * FROM recordings WHERE file_key=?', (file_key,)).fetchone())
 
     def _insert(self, file_key, phase, body):
-        self._db.execute('INSERT INTO outbox(file_key,phase,key,body) VALUES (?,?,?,?)',
+        self._db.execute('INSERT INTO outbox(file_key,phase,key,body,created_at) VALUES (?,?,?,?,?)',
                          (file_key, phase, uuid.uuid4().hex,
-                          json.dumps(body, ensure_ascii=True, allow_nan=False, sort_keys=True)))
+                          json.dumps(body, ensure_ascii=True, allow_nan=False, sort_keys=True), time.time()))
 
     def enqueue(self, file_key, phase, body, audit=None):
         if phase not in ('update', 'close'):
@@ -156,4 +160,6 @@ class ReportStore:
     def summary(self):
         with self._lock:
             return [dict(r) for r in self._db.execute(
-                'SELECT state,COUNT(*) AS count,MIN(id) AS oldest_id FROM outbox GROUP BY state')]
+                '''SELECT state,COUNT(*) AS count,MIN(id) AS oldest_id,
+                MAX(0, ? - MIN(created_at)) AS oldest_wait_seconds,
+                SUM(length(CAST(body AS BLOB))) AS payload_bytes FROM outbox GROUP BY state''', (time.time(),))]

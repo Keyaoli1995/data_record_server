@@ -125,7 +125,15 @@ class ReportWorker:
                     next_scan = now + self.config.update_interval
                 self.deliver()
                 if now >= next_summary:
-                    LOGGER.info('Web notification queue: %s', self.store.summary())
+                    protected_bytes = 0
+                    for relative in self.store.protected_paths():
+                        path = self.root / relative
+                        try:
+                            if path.resolve().is_relative_to(self.root) and not path.is_symlink():
+                                protected_bytes += path.stat().st_size
+                        except OSError:
+                            pass
+                    LOGGER.info('Web notification queue: %s protected_file_bytes=%s', self.store.summary(), protected_bytes)
                     next_summary = now + 60
             except Exception:
                 # Do not expose remote response bodies/credentials in logs. Retry local queue operations.
