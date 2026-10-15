@@ -74,6 +74,7 @@ class DeploymentFilesTest(unittest.TestCase):
             ),
             "Dockerfile must make /data writable by collector",
         )
+        self.assertIn('PYTHONTZPATH=""', environment)
         self.assertIn("WORKDIR /app", instructions)
         self.assertIn("COPY requirements-reporting.txt /app/requirements-reporting.txt", instructions)
         self.assertTrue(any("pip install" in line and "requirements-reporting.txt" in line for line in instructions))
