@@ -1,0 +1,3 @@
+# Offline timezone polygons, including historical IANA zone distinctions.
+# Python 3.12 supported; code MIT, bundled boundary data ODbL-1.0.
+timezonefinder==6.5.9
