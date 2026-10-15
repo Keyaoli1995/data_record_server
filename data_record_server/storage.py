@@ -1,6 +1,7 @@
 """Device-scoped JSONL record persistence and lifecycle events."""
 
 import json
+import os
 import stat
 import threading
 import uuid
@@ -47,7 +48,9 @@ class DeviceSession:
         relative_path: str,
         stream: BinaryIO,
         events: JsonlEventWriter,
+        reporting=None,
     ) -> None:
+        self._reporting = reporting
         self.device_id = device_id
         self.relative_path = relative_path
         self._stream = stream
@@ -136,9 +139,20 @@ class DeviceSession:
         self._closed = True
         close_error = None  # type: Optional[BaseException]
         try:
-            self._stream.close()
+            if self._reporting is not None:
+                self._stream.flush()
+                os.fsync(self._stream.fileno())
         except BaseException as error:
             close_error = error
+        try:
+            self._stream.close()
+        except BaseException as error:
+            if close_error is None:
+                close_error = error
+        if self._reporting is not None:
+            self._reporting.closed(self.relative_path,
+                                   "handler_error" if close_error else reason,
+                                   format_time(closed_at))
         try:
             self._events.write(
                 {
@@ -246,7 +260,8 @@ class RejectedConnectionRecorder:
 class Storage:
     """Maintain active device sessions and record their lifecycle events."""
 
-    def __init__(self, data_dir: Path, clock: Clock = utc_now) -> None:
+    def __init__(self, data_dir: Path, clock: Clock = utc_now, reporting=None) -> None:
+        self.reporting = reporting
         self._data_dir = Path(data_dir)
         self._data_dir.mkdir(parents=True, exist_ok=True)
         self._events = JsonlEventWriter(self._data_dir / "events.jsonl")
@@ -385,6 +400,8 @@ class Storage:
         with self._rejected_paths_lock:
             active_paths = active_session_paths | set(self._active_rejected_paths)
 
+        if self.reporting is not None:
+            active_paths |= self.reporting.protected_paths()
         self._cleanup_device_archives(device_retention_days, now, trigger, active_paths)
         self._cleanup_connection_archives(
             connection_retention_days, now, trigger, active_paths
@@ -512,8 +529,10 @@ class Storage:
         relative_path = path.relative_to(self._data_dir).as_posix()
 
         directory.mkdir(parents=True, exist_ok=True)
+        if self.reporting is not None:
+            self.reporting.register(relative_path, device_id, timestamp)
         stream = path.open("xb")
-        session = DeviceSession(device_id, relative_path, stream, self._events)
+        session = DeviceSession(device_id, relative_path, stream, self._events, self.reporting)
         try:
             self._events.write(
                 {

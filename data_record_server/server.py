@@ -346,6 +346,11 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             "Failed to close active device sessions during server close",
             primary_error,
         )
+        reporting = getattr(self.storage, "reporting", None)
+        if reporting is not None:
+            primary_error = self._run_cleanup_step(
+                reporting.stop, "Failed to stop Web reporting", primary_error
+            )
         primary_error = self._run_cleanup_step(
             super().server_close,
             "Failed to close TCP server socket",
@@ -426,15 +431,27 @@ class CollectorServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 def create_server(config: Config) -> CollectorServer:
     """Create a collector bound to the configured address."""
-    return CollectorServer(
-        (config.host, config.port),
-        Storage(config.data_dir),
-        config.read_buffer_bytes,
-        config.idle_timeout_seconds,
-        config.max_json_line_bytes,
-        config.device_retention_days,
-        config.connection_retention_days,
-    )
+    reporting = None
+    if config.reporting.enabled:
+        from .reporting_service import ReportingService
+        reporting = ReportingService(config.data_dir, config.reporting)
+    try:
+        server = CollectorServer(
+            (config.host, config.port),
+            Storage(config.data_dir, reporting=reporting),
+            config.read_buffer_bytes,
+            config.idle_timeout_seconds,
+            config.max_json_line_bytes,
+            config.device_retention_days,
+            config.connection_retention_days,
+        )
+        if reporting is not None:
+            reporting.start()
+        return server
+    except BaseException:
+        if reporting is not None:
+            reporting.stop()
+        raise
 
 
 def create_shutdown_handler(server: CollectorServer) -> Callable[[int, object], None]:

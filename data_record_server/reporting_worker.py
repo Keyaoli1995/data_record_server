@@ -25,11 +25,13 @@ class ReportWorker:
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.zone_factory = zone_factory
         self.jitter = jitter
+        self.before_prepare = lambda: None
         self._scanners = {}
         self._stop = threading.Event()
         self._thread = None
 
     def prepare(self):
+        self.before_prepare()
         for row in self.store.recordings():
             if row['state'] not in ('OPEN', 'CLOSED'):
                 self._scanners.pop(row['file_key'], None)
