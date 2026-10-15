@@ -75,3 +75,10 @@ class ReportingStoreTest(unittest.TestCase):
         self.register()
         with self.assertRaises(ValueError):
             self.store.register('devices/device-D1/a.jsonl', 'D2', '2026-10-15T00:00:00Z')
+
+    def test_queue_summary_exposes_age_and_payload_bytes(self):
+        self.register()
+        summary=self.store.summary()[0]
+        self.assertIn('oldest_wait_seconds',summary)
+        self.assertGreater(summary['payload_bytes'],0)
+        self.assertGreaterEqual(summary['oldest_wait_seconds'],0)
