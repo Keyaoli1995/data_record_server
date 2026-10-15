@@ -133,3 +133,8 @@ docker compose down
 `data/` 是 bind mount，重启、停止或重建容器不会删除 `data/devices/`、`data/connections/` 或 `events.jsonl`。服务启动后立即清理一次，随后每天服务器本地时间跨越 `00:00` 时清理一次：删除超过 `DEVICE_RETENTION_DAYS` 的非活跃 `devices/**/*.jsonl`，以及超过 `RETENTION_DAYS` 的非活跃 `connections/*.bin`，并分别记录 `device_retention_cleanup` 与 `connection_retention_cleanup` 事件。`events.jsonl` 永不由该清理任务删除。拒绝连接 `.bin` 没有单连接大小上限，仍须监控磁盘使用量并按需要备份。
 
 若日志出现 `Permission denied`，执行 `docker compose down`，再以 Compose 使用的同一 UID/GID 运行 `scripts/prepare-data-dir.sh` 后重新启动。若客户端得到 `connection refused`，依次检查 `docker compose ps`、服务日志、`docker compose port` 及安全组/防火墙的来源 IP 和端口。
+
+
+## Web 录制文件上报（2026-10-15）
+
+已实现默认关闭的创建、更新、结束三阶段通知，以及持久化补发、重启恢复和全球作业地时区识别。配置与维护见 [Web 上报接入与运维](docs/web-reporting-operations.md)。真实 Web 接口和镜像部署尚需环境联调；仅启用本地录制时无需配置 Web。

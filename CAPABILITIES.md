@@ -67,3 +67,8 @@ docker compose exec collector sh -c 'ulimit -n; cat /proc/self/limits'
 ```
 
 完整步骤见 [README.md](README.md) 与 [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)。
+
+
+## Web 录制文件上报（2026-10-15）
+
+已实现默认关闭的创建、更新、结束三阶段通知，以及持久化补发、重启恢复和全球作业地时区识别。配置与维护见 [Web 上报接入与运维](docs/web-reporting-operations.md)。真实 Web 接口和镜像部署尚需环境联调；仅启用本地录制时无需配置 Web。

@@ -125,3 +125,8 @@ fi
 `data/` 是 bind mount，`docker compose restart`、`down` 或重建容器不会删除其中的数据。请按需要备份 `data/devices/`、`data/connections/` 与 `data/events.jsonl`。保留清理不会删除事件日志，且拒绝连接的单个 `.bin` 没有大小上限；请持续监控磁盘容量。
 
 出现 `Permission denied` 时，先停止容器，以与 Compose 完全相同的 UID/GID 重新执行 `scripts/prepare-data-dir.sh`，再启动容器。出现 `connection refused` 时，检查 `docker compose ps`、`docker compose logs --tail=100 collector`、端口映射以及安全组/防火墙规则。
+
+
+## Web 录制文件上报（2026-10-15）
+
+已实现默认关闭的创建、更新、结束三阶段通知，以及持久化补发、重启恢复和全球作业地时区识别。配置与维护见 [Web 上报接入与运维](docs/web-reporting-operations.md)。真实 Web 接口和镜像部署尚需环境联调；仅启用本地录制时无需配置 Web。
