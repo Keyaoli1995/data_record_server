@@ -1,5 +1,7 @@
 import os
-from dataclasses import dataclass
+import math
+from urllib.parse import urlsplit
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Optional
 
@@ -7,6 +9,55 @@ from typing import Mapping, Optional
 MAX_JSON_LINE_BYTES = 65536
 DEFAULT_DEVICE_RETENTION_DAYS = 365
 DEFAULT_CONNECTION_RETENTION_DAYS = 30
+
+
+@dataclass(frozen=True)
+class ReportingConfig:
+    enabled: bool = False
+    base_url: str = ""
+    environment: str = ""
+    authorization: str = field(default="", repr=False)
+    update_interval: float = 10.0
+    request_timeout: float = 5.0
+    shutdown_reason: str = "SERVER_SHUTDOWN"
+
+    @classmethod
+    def from_environ(cls, env):
+        enabled = _boolean(env.get("WEB_REPORTING_ENABLED", "false"))
+        if not enabled:
+            return cls()
+        base = env.get("WEB_BASE_URL", "").rstrip("/")
+        url = urlsplit(base)
+        allow_http = _boolean(env.get("WEB_ALLOW_HTTP", "false"))
+        if (url.scheme not in (("https", "http") if allow_http else ("https",))
+                or not url.hostname or url.username or url.password
+                or url.path or url.query or url.fragment):
+            raise ValueError("WEB_BASE_URL must be an HTTPS origin (HTTP requires WEB_ALLOW_HTTP)")
+        for key in ("WEB_ENVIRONMENT", "WEB_AUTHORIZATION"):
+            value = env.get(key, "")
+            if not value.strip() or any(ord(c) < 32 or ord(c) > 126 for c in value):
+                raise ValueError(key + " must be a nonempty ASCII header value")
+        limits = []
+        for key, default in (("WEB_UPDATE_INTERVAL_SECONDS", "10"),
+                             ("WEB_REQUEST_TIMEOUT_SECONDS", "5")):
+            try:
+                value = float(env.get(key, default))
+            except ValueError:
+                raise ValueError(key + " must be finite and positive") from None
+            if not math.isfinite(value) or value <= 0 or value > 3600:
+                raise ValueError(key + " must be in (0, 3600]")
+            limits.append(value)
+        reason = env.get("WEB_SHUTDOWN_REASON", "SERVER_SHUTDOWN")
+        if not reason or not all(c.isascii() and (c.isupper() or c == "_") for c in reason):
+            raise ValueError("WEB_SHUTDOWN_REASON must be an uppercase enum")
+        return cls(True, base, env["WEB_ENVIRONMENT"], env["WEB_AUTHORIZATION"],
+                   *limits, reason)
+
+
+def _boolean(value):
+    if value.lower() not in ("true", "false"):
+        raise ValueError("reporting boolean settings must be true or false")
+    return value.lower() == "true"
 
 
 @dataclass(frozen=True)
@@ -19,6 +70,8 @@ class Config:
     max_json_line_bytes: int = MAX_JSON_LINE_BYTES
     device_retention_days: int = DEFAULT_DEVICE_RETENTION_DAYS
     connection_retention_days: int = DEFAULT_CONNECTION_RETENTION_DAYS
+
+    reporting: ReportingConfig = field(default_factory=ReportingConfig)
 
     @classmethod
     def from_environ(
@@ -63,6 +116,7 @@ class Config:
             raise ValueError("RETENTION_DAYS must be positive")
 
         return cls(
+            reporting=ReportingConfig.from_environ(environment),
             host=environment.get("TCP_HOST", "0.0.0.0"),
             port=port,
             data_dir=Path(environment.get("DATA_DIR", "/data")),
