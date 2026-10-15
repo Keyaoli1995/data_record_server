@@ -80,3 +80,12 @@ class FileStatsTest(unittest.TestCase):
         self.assertEqual(loc['latitude'], 28.2)
         self.assertNotIn('accuracyMeters', loc)
         self.assertEqual(loc['coordinateMode'], 'WGS84')
+
+    def test_large_accepted_json_line_is_not_corruption(self):
+        self.write([{'deviceId':'D1','gpsTime':1000,'extension':'x'*70000}])
+        self.stats.scan(self.path, final=True)
+        self.assertTrue(self.stats.valid)
+        self.assertEqual(self.stats.snapshot()['recordCount'],1)
+
+    def test_gps_upper_bound_preserves_millisecond(self):
+        self.assertEqual(reporting_models.gps_iso(253402300799999),'9999-12-31T23:59:59.999Z')

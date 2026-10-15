@@ -72,3 +72,9 @@ class ClientTest(unittest.TestCase):
             reporting_client.ReportClient(self.config, send=fail).send(self.item)
         self.assertTrue(cm.exception.retryable)
         self.assertNotIn('secret', str(cm.exception))
+
+    def test_permanent_business_error_takes_precedence_over_503(self):
+        with self.assertRaises(reporting_client.ReportError) as cm:
+            self.client(status=503,body={'code':'RakingRecordingTaskTimedOut'}).send(self.item)
+        self.assertFalse(cm.exception.retryable)
+        self.assertEqual(cm.exception.code,'RakingRecordingTaskTimedOut')
