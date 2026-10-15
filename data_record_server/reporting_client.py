@@ -3,6 +3,7 @@
 import json
 import math
 import time
+from http.client import HTTPException
 from email.utils import parsedate_to_datetime
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -60,7 +61,7 @@ class ReportClient:
                 status = response.status
                 raw = response.read(1024 * 1024 + 1)
                 delay = retry_delay(response.headers.get('Retry-After'))
-        except (OSError, URLError, TimeoutError):
+        except (OSError, URLError, TimeoutError, HTTPException):
             # Do not persist exception messages: upstream URLs or response bodies may contain credentials.
             raise ReportError('NETWORK_ERROR', True) from None
         if len(raw) > 1024 * 1024:

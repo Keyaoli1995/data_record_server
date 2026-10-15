@@ -66,7 +66,12 @@ class ReportWorker:
         saved_audit = json.loads(row['timezone_audit']) if row['timezone_audit'] else None
         if saved_audit and saved_audit.get('name'):
             snapshot['timezone'] = saved_audit['name']
-        audit = saved_audit or scanner.zone.audit
+        audit = scanner.zone.audit
+        if saved_audit and saved_audit.get('name'):
+            if audit.get('name') != saved_audit['name']:
+                audit = saved_audit
+            else:
+                audit['conflict_count'] = max(audit.get('conflict_count', 0), saved_audit.get('conflict_count', 0))
         if final:
             payload = {key: snapshot[key] for key in
                        ('recordCount','sizeBytes','firstGpsTime','lastGpsTime')}
