@@ -22,6 +22,9 @@ class ReportingService:
         directory.mkdir(parents=True, exist_ok=True)
         self._lease = (directory / 'collector.lock').open('a')
         self._closed = False
+        self._stopped = threading.Event()
+        self._stop_lock = threading.Lock()
+        self._finalizer = None
         self._pending = {}
         self._pending_lock = threading.Lock()
         self.store = None
@@ -65,14 +68,33 @@ class ReportingService:
     def start(self):
         self.worker.start()
 
+    def wait_stopped(self, timeout):
+        return self._stopped.wait(timeout)
+
     def stop(self):
-        if self._closed:
-            return
-        self.flush_closures()
-        if not self.worker.stop():
-            # Keep exclusive ownership until the daemon exits; never close SQLite under a live worker.
-            LOGGER.error('Reporting worker still stopping; durable notifications remain pending')
-            return
-        self.store.close()
-        self._lease.close()
-        self._closed = True
+        with self._stop_lock:
+            if self._closed:
+                return
+            if self._finalizer is None:
+                self._finalizer = threading.Thread(target=self._finish, name='reporting-finalizer', daemon=True)
+                self._finalizer.start()
+        if not self.wait_stopped(self.config.request_timeout + 1):
+            LOGGER.warning('Reporting still stopping; persisted closure intents will recover on restart')
+
+    def _finish(self):
+        try:
+            self.worker.stop()
+            if self.worker._thread is not None:
+                self.worker._thread.join()
+            self.flush_closures()
+            # Generate final outbox records without delaying the public stop indefinitely.
+            self.worker.prepare()
+        except Exception:
+            LOGGER.error('Reporting finalization incomplete; persistent state retained')
+        finally:
+            try:
+                self.store.close()
+            finally:
+                self._lease.close()
+                self._closed = True
+                self._stopped.set()
