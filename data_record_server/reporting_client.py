@@ -73,8 +73,15 @@ class ReportClient:
         # Permanent business errors take precedence even when a proxy returned 5xx.
         known = {'RakingRecordingTaskTimedOut','RakingFileAlreadyFinished',
                  'RakingUnauthorized','RakingFileValidationFailed','RakingEnvironmentMismatch',
-                 'RakingFileSequenceConflict','RakingLocatorDisabled','RakingInvalidRequest'}
+                 'RakingFileSequenceConflict','RakingLocatorDisabled','RakingInvalidRequest',
+                 'RakingFileNotReady','RakingRecordingTimezoneInvalid','RakingLocatorNotFound',
+                 'RakingFileUnavailable','RakingStoragePathInvalid','RakingDeviceMismatch',
+                 'RakingRecordingTaskNotSelectable','RakingDuplicateFile','RakingLocatorAlreadyExists'}
         code = result.get('code') if isinstance(result, dict) else None
+        data = result.get('data') if isinstance(result, dict) else None
+        business_code = data.get('errorCode') if isinstance(data, dict) else None
+        if isinstance(business_code, str) and business_code in known:
+            raise ReportError(business_code)
         if isinstance(code, str) and code in known:
             raise ReportError(code)
         if not 200 <= status < 300:
