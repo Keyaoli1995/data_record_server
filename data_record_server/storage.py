@@ -420,12 +420,15 @@ class Storage:
             self._device_archive_paths(), active_paths, cutoff, self._data_dir
         )
 
-        for directory in self._device_directories():
-            try:
-                if stat.S_ISDIR(directory.lstat().st_mode):
-                    directory.rmdir()
-            except OSError:
-                pass
+        # Session creation holds this lock from mkdir through opening the file.
+        # Do not remove its temporarily empty directory during that interval.
+        with self._sessions_lock:
+            for directory in self._device_directories():
+                try:
+                    if stat.S_ISDIR(directory.lstat().st_mode):
+                        directory.rmdir()
+                except OSError:
+                    pass
 
         self._write_cleanup_event(
             "device_retention_cleanup",
