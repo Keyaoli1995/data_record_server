@@ -35,6 +35,8 @@ class ReportingConfig:
             raise ValueError("WEB_BASE_URL must be an HTTPS origin (HTTP requires WEB_ALLOW_HTTP)")
         for key in ("WEB_ENVIRONMENT", "WEB_AUTHORIZATION"):
             value = env.get(key, "")
+            if key == "WEB_AUTHORIZATION" and not value:
+                continue
             if not value.strip() or any(ord(c) < 32 or ord(c) > 126 for c in value):
                 raise ValueError(key + " must be a nonempty ASCII header value")
         limits = []
@@ -50,7 +52,7 @@ class ReportingConfig:
         reason = env.get("WEB_SHUTDOWN_REASON", "SERVER_SHUTDOWN")
         if not reason or not all(c.isascii() and (c.isupper() or c == "_") for c in reason):
             raise ValueError("WEB_SHUTDOWN_REASON must be an uppercase enum")
-        return cls(True, base, env["WEB_ENVIRONMENT"], env["WEB_AUTHORIZATION"],
+        return cls(True, base, env["WEB_ENVIRONMENT"], env.get("WEB_AUTHORIZATION", ""),
                    *limits, reason)
 
 

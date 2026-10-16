@@ -17,19 +17,22 @@ from data_record_server.worksite_timezone import WorksiteTimezone
 
 class ReportingIntegrationTest(unittest.TestCase):
     def test_tcp_recording_http_replay_and_restart(self):
+        self_test = self
         accepted=[]; seen={}; finished=threading.Event(); lose_first=[True]
         class Handler(BaseHTTPRequestHandler):
             def log_message(self,*args): pass
             def do_POST(self): self.handle_request()
             def do_PATCH(self): self.handle_request()
             def handle_request(self):
+                self_test.assertIsNone(self.headers.get('Authorization'))
+                self_test.assertIsNone(self.headers.get('X-Environment'))
                 body=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
                 key=self.headers['Idempotency-Key']
                 if key in seen:
                     if seen[key][0] != body: raise AssertionError('retry mutated payload')
                     response=seen[key][1]
                 else:
-                    if self.path.endswith('/close/'):
+                    if self.path.endswith('/closure/'):
                         file_key=self.path.split('/')[-3];status='READY'
                     elif self.command=='PATCH':
                         file_key=self.path.split('/')[-2];status='RECORDING'
@@ -43,13 +46,13 @@ class ReportingIntegrationTest(unittest.TestCase):
                     lose_first[0]=False;self.close_connection=True;return
                 encoded=json.dumps(response).encode();self.send_response(200)
                 self.send_header('Content-Length',str(len(encoded)));self.end_headers();self.wfile.write(encoded)
-                if self.path.endswith('/close/'):finished.set()
+                if self.path.endswith('/closure/'):finished.set()
         http=ThreadingHTTPServer(('127.0.0.1',0),Handler)
         ht=threading.Thread(target=http.serve_forever,daemon=True);ht.start()
         try:
             with tempfile.TemporaryDirectory() as td:
                 root=Path(td);now=[datetime(2026,10,15,tzinfo=timezone.utc)]
-                config=ReportingConfig(True,'http://127.0.0.1:'+str(http.server_port),'test','Bearer test',.01,1)
+                config=ReportingConfig(True,'http://127.0.0.1:'+str(http.server_port),'test','',.01,1)
                 report=ReportingService(root,config,clock=lambda:now[0])
                 report.worker.zone_factory=lambda:WorksiteTimezone(lambda lat,lon:'Asia/Shanghai')
                 storage=Storage(root,clock=lambda:now[0],reporting=report)

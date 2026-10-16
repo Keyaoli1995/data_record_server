@@ -12,7 +12,7 @@ Web 需确认：唯一文件正常结束并校验为 READY 后，将所属任务
 
 本次负责录制、统计、创建/更新/关闭通知、可靠补发和作业地时区识别；不改解析脚本，不实现 Web 索引、实时流、地图管理，不在本次文档任务中部署或推送。
 
-更新周期、自动时区识别及恢复策略已按用户授权实施；人工时区覆盖和可选 points 不在首版范围。接口地址和鉴权凭据由 Web 提供；缺失时可以完成模拟测试，但不得宣称真实联调通过。
+更新周期、自动时区识别及恢复策略已按用户授权实施；人工时区覆盖和可选 points 不在首版范围。接口内网地址由 Web 提供；新版 ICD 的三个录制上报接口免登录鉴权。未核验实际接口时可以完成模拟测试，但不得宣称真实联调通过。
 
 ## 2. 现状与改动位置
 
@@ -40,11 +40,11 @@ Web 需确认：唯一文件正常结束并校验为 READY 后，将所属任务
 | --- | --- | --- |
 | 创建 | POST `/api/v2.4/manual-raking/recording-files/` | schemaVersion=1、rakingRecordingTaskId、fileKey、rakingLocatorSn、sequence=1、storageUri、openedAt |
 | 更新 | PATCH `/api/v2.4/manual-raking/recording-files/{fileKey}/` | schemaVersion=1、sequence、updatedAt、recordCount、sizeBytes |
-| 结束 | POST `/api/v2.4/manual-raking/recording-files/{fileKey}/close/` | schemaVersion=1、sequence、closedAt、firstGpsTime、lastGpsTime、recordCount、sizeBytes、storageUri、sha256、closeReason |
+| 结束 | POST `/api/v2.4/manual-raking/recording-files/{fileKey}/closure/` | schemaVersion=1、sequence、closedAt、firstGpsTime、lastGpsTime、recordCount、sizeBytes、storageUri、sha256、closeReason |
 
 各阶段可携带 timezone；创建可带 firstGpsTime；更新可带 lastGpsTime、lastReportedDataAt、currentLocation。首版建议上报最新位置，不上传可选 points 数组；因此不承诺完整实时轨迹历史，若 Web 需要该能力，应单独确认采样频率和可靠传输范围。
 
-所有请求发送 `Content-Type: application/json`、`X-Environment` 和稳定的 `Idempotency-Key`。鉴权通过独立配置注入，不在仓库、队列请求体和日志中保存明文凭据。Web 未提供签名算法前，不自创签名协议。
+所有请求发送 `Content-Type: application/json` 和稳定的 `Idempotency-Key`，不发送 `X-Environment`。Web 环境由部署配置决定，本地 `WEB_ENVIRONMENT` 仅用于队列隔离。默认不发送 Authorization；可选网关鉴权通过独立配置注入，不在队列和日志中保存凭据。三个免鉴权接口仅允许内网调用，网络与反向代理负责来源限制。
 
 成功需要 HTTP 成功、响应 JSON `code=0`、身份和状态与请求匹配。创建/更新只确认已接受；正常关闭需 READY，异常关闭需 ABORTED。HTTP 200 本身不是成功；未知响应保留通知并告警。
 
@@ -102,7 +102,7 @@ Web 任务超时是远端终态：收到 TIMEOUT 不换 ID 重复上报旧文件
 
 ## 8. 配置和启停
 
-新增开关默认关闭；关闭时保持原行为。启用必须提供 Web 根地址、环境、认可的鉴权配置和存储根映射。生产 HTTPS 校验证书，不将鉴权头转发到重定向地址。无有效地理库时自动时区不可用应有明确告警，不能影响原始数据写入。
+新增开关默认关闭；关闭时保持原行为。启用必须确认 Web 内网根地址、本地队列环境标识和存储根映射；鉴权配置为可选。生产 HTTPS 校验证书，不将鉴权头转发到重定向地址。无有效地理库时自动时区不可用应有明确告警，不能影响原始数据写入。
 
 生命周期：初始化持久化队列和恢复记录 → 启动发送器 → TCP 接收 → 停机停止新接入并关闭文件 → 落盘最终通知 → 有界等待发送器退出。Web 不可达不无限阻塞停机，未发送记录留到下次启动。
 
@@ -128,3 +128,7 @@ Web 任务超时是远端终态：收到 TIMEOUT 不换 ID 重复上报旧文件
 - 位置缺少高度或精度时不编造数值；当前上报位置可省略对应字段，需 Web 对 currentLocation 子字段的可空性确认。
 - 停机在有限等待内尽量生成最终 outbox；大文件扫描超过预算时已持久化 CLOSED 意图，后台继续收尾，若进程被终止则重启恢复。不能为等待 Web 而无限阻塞停机。
 - 运行配置、历史补录、积压查询和限制见 [接入与运维](../../web-reporting-operations.md)。
+
+## 新版 ICD 适配说明（2026-10-16）
+
+按用户提供的新版 ICD 第4.0～4.1节调整结束路径、可选鉴权与环境请求头。保持一文件一任务、全球作业地时区、统计字段、幂等补发和恢复语义不变；points 仍为可选且暂不发送。本次附件到第4.3.1节请求示例结束，不据此修改未提供的解析脚本契约。已有队列身份及请求体不变，发送端采用新路径；已被旧路径错误阻塞的请求需排查后按运维步骤重试，不能自动解除远端终态。

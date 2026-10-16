@@ -20,16 +20,18 @@
 WEB_REPORTING_ENABLED=false
 WEB_BASE_URL=https://web.example.invalid
 WEB_ENVIRONMENT=test
-WEB_AUTHORIZATION=Bearer REPLACE_WITH_SERVICE_TOKEN
+WEB_AUTHORIZATION=
 WEB_ALLOW_HTTP=false
 WEB_UPDATE_INTERVAL_SECONDS=10
 WEB_REQUEST_TIMEOUT_SECONDS=5
 WEB_SHUTDOWN_REASON=SERVER_SHUTDOWN
 ```
 
-启用前必须将 URL、环境和 Authorization 替换为 Web 正式提供的值，并确认三阶段接口、唯一文件 READY 后任务 FINISHED、GPS min/max和停机原因枚举。当前支持配置完整 Authorization 头；若最终采用动态签名协议，需新增签名适配，不假装已经兼容。
+新版 ICD 的三个录制上报接口免登录鉴权，通过内网调用，由网络和路由 ACL 限制来源，不应暴露到公网。启用前确认内网 URL、存储根映射、三阶段接口和停机原因枚举。WEB_AUTHORIZATION 可以省略或留空，此时不发送 Authorization；仅在网关另有要求时配置完整请求头值。
 
-URL 只填 origin（协议、主机和端口），不带 `/api`、路径、查询或用户名密码。默认 HTTPS 校验证书，禁止重定向携带凭据；本地模拟 HTTP 需显式 WEB_ALLOW_HTTP=true。环境和 origin 与 outbox 绑定，改变后拒绝启动，防止把积压发往其他区域；凭据轮换可保持原库重试。
+WEB_ENVIRONMENT 仍是必填的本地队列隔离标识，不会作为 X-Environment 请求头或请求参数发送。Web 的业务环境仅由其部署配置决定。创建、更新路径不变，结束路径为 POST `/api/v2.4/manual-raking/recording-files/{fileKey}/closure/`，不再调用 `/close/`。
+
+URL 只填 origin（协议、主机和端口），不带 `/api`、路径、查询或用户名密码。默认 HTTPS 校验证书，禁止重定向携带凭据；已确认的内网 HTTP 地址需显式 WEB_ALLOW_HTTP=true（本地模拟同样适用），默认仍只接受 HTTPS。环境和 origin 与 outbox 绑定，改变后拒绝启动，防止把积压发往其他区域；凭据轮换可保持原库重试。
 
 正常关闭原因采用 IDLE_TIMEOUT；服务停机默认 SERVER_SHUTDOWN（待 Web 确认），可以按双方认可的枚举配置。异常使用 ABORTED，不能把服务停机冒充 USER_STOPPED 或 DEVICE_SHUTDOWN。
 

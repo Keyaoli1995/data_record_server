@@ -34,7 +34,7 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(self.request.full_url, 'https://example.test/api/v2.4/manual-raking/recording-files/')
         self.assertEqual(self.request.get_header('Idempotency-key'), 'key1')
         self.assertEqual(self.request.get_header('Authorization'), 'Bearer secret')
-        self.assertEqual(self.request.get_header('X-environment'), 'test')
+        self.assertIsNone(self.request.get_header('X-environment'))
         self.assertEqual(self.request.method, 'POST')
         self.item['phase']='update'; self.item['body']={'sequence':2}
         self.client(body=self.response(acceptedSequence=2)).send(self.item)
@@ -45,6 +45,7 @@ class ClientTest(unittest.TestCase):
         self.item['phase']='close'; self.item['body']={'closeReason':'IDLE_TIMEOUT','sequence':3}
         with self.assertRaises(reporting_client.ReportError): self.client().send(self.item)
         self.client(body=self.response(status='READY')).send(self.item)
+        self.assertTrue(self.request.full_url.endswith('/file1/closure/'))
         self.item['body']['closeReason']='ABORTED'
         self.client(body=self.response(status='ABORTED')).send(self.item)
 
@@ -94,3 +95,13 @@ class ClientTest(unittest.TestCase):
             self.assertEqual(cm.exception.code,'RakingRecordingTaskTimedOut')
             self.assertFalse(cm.exception.retryable)
             self.assertNotIn('secret',str(cm.exception))
+
+    def test_internal_reporting_omits_auth_and_environment_for_every_phase(self):
+        self.config = ReportingConfig(True, 'https://example.test', 'local-test')
+        for phase, state in (('create', 'RECORDING'), ('update', 'RECORDING'), ('close', 'READY')):
+            with self.subTest(phase=phase):
+                self.item.update(phase=phase, body={'sequence': 3, 'closeReason': 'IDLE_TIMEOUT'})
+                self.client(body=self.response(status=state, acceptedSequence=3)).send(self.item)
+                self.assertIsNone(self.request.get_header('Authorization'))
+                self.assertIsNone(self.request.get_header('X-environment'))
+                self.assertEqual('key1', self.request.get_header('Idempotency-key'))

@@ -17,7 +17,7 @@ class ReportingConfigTest(unittest.TestCase):
         self.assertNotIn('secret', repr(value))
 
     def test_required_values_and_unsafe_urls(self):
-        for key in ('WEB_BASE_URL', 'WEB_ENVIRONMENT', 'WEB_AUTHORIZATION'):
+        for key in ('WEB_BASE_URL', 'WEB_ENVIRONMENT'):
             env = self.env(); env.pop(key)
             with self.subTest(key=key), self.assertRaises(ValueError):
                 Config.from_environ(env)
@@ -39,3 +39,14 @@ class ReportingConfigTest(unittest.TestCase):
     def test_explicit_insecure_http_for_local_mock(self):
         env = self.env(WEB_ALLOW_HTTP='true'); env['WEB_BASE_URL'] = 'http://localhost:8000'
         self.assertTrue(Config.from_environ(env).reporting.enabled)
+
+    def test_internal_reporting_does_not_require_authorization(self):
+        for value in (None, ''):
+            env = self.env()
+            if value is None:
+                env.pop('WEB_AUTHORIZATION')
+            else:
+                env['WEB_AUTHORIZATION'] = value
+            config = Config.from_environ(env).reporting
+            self.assertTrue(config.enabled)
+            self.assertEqual('', config.authorization)

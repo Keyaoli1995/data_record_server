@@ -1,4 +1,4 @@
-"""Bounded, authenticated HTTP transport for the Web ICD."""
+"""Bounded HTTP transport for the Web ICD."""
 
 import json
 import math
@@ -44,14 +44,15 @@ class ReportClient:
         if phase != 'create':
             path += item['file_key'] + '/'
         if phase == 'close':
-            path += 'close/'
+            path += 'closure/'
+        # The Web deployment chooses the environment; never send a selector.
+        headers = {'Content-Type': 'application/json', 'Idempotency-Key': item['key']}
+        if self.config.authorization:
+            headers['Authorization'] = self.config.authorization
         request = Request(self.config.base_url + path,
                           data=json.dumps(item['body'], ensure_ascii=True, allow_nan=False).encode(),
                           method='PATCH' if phase == 'update' else 'POST',
-                          headers={'Content-Type':'application/json',
-                                   'X-Environment':self.config.environment,
-                                   'Idempotency-Key':item['key'],
-                                   'Authorization':self.config.authorization})
+                          headers=headers)
         try:
             try:
                 response = self._send(request, timeout=self.config.request_timeout)
