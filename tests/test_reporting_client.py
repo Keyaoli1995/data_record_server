@@ -19,7 +19,7 @@ class ClientTest(unittest.TestCase):
         self.config = ReportingConfig(True, 'https://example.test', 'test', 'Bearer secret')
 
     def response(self, **changes):
-        data = dict(fileKey='file1', rakingRecordingTaskId='task1', status='RECORDING', sequence=1)
+        data = dict(fileKey='file1', recordingTaskId='task1', status='OPEN', sequence=1)
         data.update(changes)
         return {'code':0, 'data': data}
 
@@ -37,7 +37,7 @@ class ClientTest(unittest.TestCase):
         self.assertIsNone(self.request.get_header('X-environment'))
         self.assertEqual(self.request.method, 'POST')
         self.item['phase']='update'; self.item['body']={'sequence':2}
-        self.client(body=self.response(acceptedSequence=2)).send(self.item)
+        self.client(body=self.response(lastSequence=2)).send(self.item)
         self.assertEqual(self.request.method, 'PATCH')
         self.assertTrue(self.request.full_url.endswith('/file1/'))
 
@@ -45,7 +45,8 @@ class ClientTest(unittest.TestCase):
         self.item['phase']='close'; self.item['body']={'closeReason':'IDLE_TIMEOUT','sequence':3}
         with self.assertRaises(reporting_client.ReportError): self.client().send(self.item)
         self.client(body=self.response(status='READY')).send(self.item)
-        self.assertTrue(self.request.full_url.endswith('/file1/closure/'))
+        self.assertTrue(self.request.full_url.endswith('/file1/status/'))
+        self.assertEqual(self.request.method, 'PATCH')
         self.item['body']['closeReason']='ABORTED'
         self.client(body=self.response(status='ABORTED')).send(self.item)
 
@@ -58,7 +59,7 @@ class ClientTest(unittest.TestCase):
             self.assertNotIn('secret', str(cm.exception))
         self.item.update(phase='update',body={'sequence':3})
         with self.assertRaises(reporting_client.ReportError):
-            self.client(body=self.response(acceptedSequence=2)).send(self.item)
+            self.client(body=self.response(lastSequence=2)).send(self.item)
 
     def test_transient_and_permanent_http_failures(self):
         for status, retry in ((429,True),(500,True),(503,True),(401,False),(403,False),(302,False),(400,False)):
@@ -98,10 +99,24 @@ class ClientTest(unittest.TestCase):
 
     def test_internal_reporting_omits_auth_and_environment_for_every_phase(self):
         self.config = ReportingConfig(True, 'https://example.test', 'local-test')
-        for phase, state in (('create', 'RECORDING'), ('update', 'RECORDING'), ('close', 'READY')):
+        for phase, state in (('create', 'OPEN'), ('update', 'OPEN'), ('close', 'READY')):
             with self.subTest(phase=phase):
                 self.item.update(phase=phase, body={'sequence': 3, 'closeReason': 'IDLE_TIMEOUT'})
-                self.client(body=self.response(status=state, acceptedSequence=3)).send(self.item)
+                self.client(body=self.response(status=state, lastSequence=3)).send(self.item)
                 self.assertIsNone(self.request.get_header('Authorization'))
                 self.assertIsNone(self.request.get_header('X-environment'))
                 self.assertEqual('key1', self.request.get_header('Idempotency-key'))
+
+    def test_icd2_business_error_is_not_success_and_does_not_expose_message(self):
+        with self.assertRaises(reporting_client.ReportError) as cm:
+            self.client(body={'code': -1, 'msg': 'private path and token', 'data': None}).send(self.item)
+        self.assertEqual('BUSINESS_ERROR', cm.exception.code)
+        self.assertFalse(cm.exception.retryable)
+        self.assertNotIn('private', str(cm.exception))
+
+    def test_close_accepts_historical_closed_but_not_invalid(self):
+        self.item.update(phase='close', body={'sequence': 3, 'closeReason': 'IDLE_TIMEOUT'})
+        self.client(body=self.response(status='CLOSED', lastSequence=3)).send(self.item)
+        for status in ('OPEN', 'INVALID', 'ABORTED'):
+            with self.subTest(status=status), self.assertRaises(reporting_client.ReportError):
+                self.client(body=self.response(status=status, lastSequence=3)).send(self.item)

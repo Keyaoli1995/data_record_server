@@ -20,6 +20,7 @@ class ReportingConfig:
     update_interval: float = 10.0
     request_timeout: float = 5.0
     shutdown_reason: str = "SERVER_SHUTDOWN"
+    storage_root: str = ""
 
     @classmethod
     def from_environ(cls, env):
@@ -52,8 +53,13 @@ class ReportingConfig:
         reason = env.get("WEB_SHUTDOWN_REASON", "SERVER_SHUTDOWN")
         if not reason or not all(c.isascii() and (c.isupper() or c == "_") for c in reason):
             raise ValueError("WEB_SHUTDOWN_REASON must be an uppercase enum")
+        storage_root = env.get("WEB_STORAGE_ROOT", "")
+        if storage_root and (not storage_root.startswith('/') or
+                any(part in ('.', '..') for part in storage_root.split('/')) or
+                any(ord(c) < 32 for c in storage_root) or '\\' in storage_root):
+            raise ValueError('WEB_STORAGE_ROOT must be an absolute normalized filesystem path')
         return cls(True, base, env["WEB_ENVIRONMENT"], env.get("WEB_AUTHORIZATION", ""),
-                   *limits, reason)
+                   *limits, reason, storage_root)
 
 
 def _boolean(value):

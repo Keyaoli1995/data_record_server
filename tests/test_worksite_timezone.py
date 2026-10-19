@@ -38,12 +38,12 @@ class WorksiteTimezoneTest(unittest.TestCase):
     def test_invalid_samples_reset_candidate(self):
         invalid = [{}, {"GNSSPosStat": True}, {"GNSSPosStat": 4.0},
                    {"GNSSPosStat": "5"}, {"GNSSPosStat": None},
-                   {"GNSSlat": True}, {"GNSSlat": "31.2"},
+                   {"GNSSlat": True}, {"GNSSlat": "bad"},
                    {"GNSSlat": float("nan")}, {"GNSSlon": float("inf")},
                    {"GNSSlat": 91}, {"GNSSlon": -181},
                    {"GNSSlat": 0, "GNSSlon": 0},
                    {"gpsTime": True}, {"gpsTime": 2000.0},
-                   {"gpsTime": "2000"}, {"gpsTime": -1},
+                   {"gpsTime": "2000.5"}, {"gpsTime": -1},
                    {"gpsTime": 10 ** 100}]
         for changes in invalid:
             with self.subTest(changes=changes):
@@ -259,3 +259,15 @@ class GlobalGeographicTimezoneTest(unittest.TestCase):
             instant = datetime(2026, month, 15, 12, tzinfo=timezone.utc)
             self.assertEqual(-10800,
                              instant.astimezone(ZoneInfo(name)).utcoffset().total_seconds())
+
+
+class NumericStringTimezoneTest(unittest.TestCase):
+    def test_direct_observations_normalize_without_mutating_input(self):
+        resolver = WorksiteTimezone(lambda lat, lon: 'Asia/Shanghai')
+        for t in ('1000', '2000', '3000'):
+            sample = record(t, GNSSlat='31.2304', GNSSlon='121.4737')
+            original = sample.copy()
+            resolver.observe(sample)
+            self.assertEqual(sample, original)
+        self.assertEqual(resolver.name, 'Asia/Shanghai')
+        self.assertEqual(resolver.audit['gps_time_ms'], 3000)

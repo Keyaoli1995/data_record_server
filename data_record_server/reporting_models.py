@@ -7,6 +7,8 @@ import os
 import stat
 from datetime import datetime, timezone
 
+from .gnss_values import normalize_record
+
 
 def valid_gps(value):
     return type(value) is int and 0 <= value <= 253402300799999
@@ -94,6 +96,7 @@ class FileStats:
         except (ValueError, UnicodeError):
             self._bad = True
             return
+        value = normalize_record(value)
         gps = value.get('gpsTime')
         if valid_gps(gps):
             self._first = gps if self._first is None else min(self._first, gps)

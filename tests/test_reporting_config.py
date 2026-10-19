@@ -50,3 +50,9 @@ class ReportingConfigTest(unittest.TestCase):
             config = Config.from_environ(env).reporting
             self.assertTrue(config.enabled)
             self.assertEqual('', config.authorization)
+
+    def test_published_root_is_absolute_and_normalized(self):
+        self.assertEqual('/shared/records', Config.from_environ(self.env(WEB_STORAGE_ROOT='/shared/records')).reporting.storage_root)
+        for root in ('relative', '/shared/../other', '/shared/./records', 'https://host/data', '/shared\x00bad'):
+            with self.subTest(root=root), self.assertRaises(ValueError):
+                Config.from_environ(self.env(WEB_STORAGE_ROOT=root))

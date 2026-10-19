@@ -75,7 +75,7 @@ class ReportWorker:
         if final:
             payload = {key: snapshot[key] for key in
                        ('recordCount','sizeBytes','firstGpsTime','lastGpsTime')}
-            payload.update(storageUri=row['path'],closedAt=row['closed_at'],sha256=scanner.sha256,
+            payload.update(storageUri=row['storage_uri'],closedAt=row['closed_at'],sha256=scanner.sha256,
                            closeReason=row['close_reason'] if scanner.valid else 'ABORTED')
             if 'timezone' in snapshot:
                 payload['timezone'] = snapshot['timezone']
@@ -83,7 +83,7 @@ class ReportWorker:
             self._scanners.pop(row['file_key'], None)
         elif snapshot['sizeBytes'] > row['last_size'] and snapshot['recordCount']:
             snapshot.pop('firstGpsTime')
-            snapshot.update(updatedAt=self.clock().isoformat().replace('+00:00','Z'), status='RECORDING')
+            snapshot.update(status='RECORDING')
             self.store.enqueue(row['file_key'], 'update', snapshot, audit)
 
     def deliver(self):

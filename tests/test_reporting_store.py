@@ -21,12 +21,24 @@ class ReportingStoreTest(unittest.TestCase):
         item = self.store.due(0)[0]
         self.assertEqual(item['phase'], 'create')
         self.assertEqual(item['body']['sequence'], 1)
+        self.assertEqual(item['body']['recordingTaskId'], one['task_id'])
+        self.assertEqual(item['body']['locatorSn'], 'D1')
+        self.assertNotIn('schemaVersion', item['body'])
         self.assertEqual(item['body']['storageUri'], one['path'])
         self.assertEqual(self.store.protected_paths(), {one['path']})
         self.store.close()
         self.store = reporting_store.ReportStore(self.path, 'test', 'https://example.test')
         self.addCleanup(self.store.close)
         self.assertEqual(self.store.due(0)[0]['key'], item['key'])
+
+    def test_storage_root_can_publish_readable_absolute_uri(self):
+        store = reporting_store.ReportStore(
+            self.path.with_name('absolute.sqlite3'), 'test', 'https://example.test',
+            storage_root=self.path.parent)
+        self.addCleanup(store.close)
+        row = store.register('devices/device-D1/a.jsonl', 'D1', '2026-10-15T00:00:00Z')
+        item = store.due(0)[0]
+        self.assertEqual(item['body']['storageUri'], str(self.path.parent / row['path']))
 
     def test_stage_order_retry_and_other_file_independence(self):
         one = self.register(); self.store.enqueue(one['file_key'], 'update', {'recordCount': 2})
@@ -82,3 +94,33 @@ class ReportingStoreTest(unittest.TestCase):
         self.assertIn('oldest_wait_seconds',summary)
         self.assertGreater(summary['payload_bytes'],0)
         self.assertGreaterEqual(summary['oldest_wait_seconds'],0)
+
+    def test_legacy_queue_is_preserved_and_quarantined_on_reopen(self):
+        import json
+        row = self.register()
+        item = self.store.due(0)[0]
+        legacy = dict(item['body'], schemaVersion=1)
+        legacy['rakingRecordingTaskId'] = legacy.pop('recordingTaskId')
+        legacy['rakingLocatorSn'] = legacy.pop('locatorSn')
+        self.store._db.execute('UPDATE outbox SET body=? WHERE id=?', (json.dumps(legacy), item['id']))
+        self.store._db.commit()
+        self.store.close()
+        self.store = reporting_store.ReportStore(self.path, 'test', 'https://example.test')
+        self.addCleanup(self.store.close)
+        self.assertEqual([], self.store.due(9999999999))
+        saved = self.store._db.execute('SELECT * FROM outbox WHERE id=?', (item['id'],)).fetchone()
+        self.assertEqual(legacy, json.loads(saved['body']))
+        self.assertEqual(item['key'], saved['key'])
+        self.assertEqual('LEGACY_ICD_RECONCILIATION_REQUIRED', self.store.recordings()[0]['error'])
+        with self.assertRaises(ValueError):
+            self.store.retry_blocked(row['file_key'])
+
+    def test_published_uri_stays_fixed_on_reopen(self):
+        self.store.close()
+        self.store = reporting_store.ReportStore(self.path, 'test', 'https://example.test', storage_root='/shared/a')
+        self.addCleanup(self.store.close)
+        row = self.register()
+        self.store.close()
+        self.store = reporting_store.ReportStore(self.path, 'test', 'https://example.test', storage_root='/shared/b')
+        self.addCleanup(self.store.close)
+        self.assertEqual('/shared/a/' + row['path'], self.store.recordings()[0]['storage_uri'])

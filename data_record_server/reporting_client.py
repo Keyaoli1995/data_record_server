@@ -44,14 +44,14 @@ class ReportClient:
         if phase != 'create':
             path += item['file_key'] + '/'
         if phase == 'close':
-            path += 'closure/'
+            path += 'status/'
         # The Web deployment chooses the environment; never send a selector.
         headers = {'Content-Type': 'application/json', 'Idempotency-Key': item['key']}
         if self.config.authorization:
             headers['Authorization'] = self.config.authorization
         request = Request(self.config.base_url + path,
                           data=json.dumps(item['body'], ensure_ascii=True, allow_nan=False).encode(),
-                          method='PATCH' if phase == 'update' else 'POST',
+                          method='PATCH' if phase in ('update', 'close') else 'POST',
                           headers=headers)
         try:
             try:
@@ -93,14 +93,14 @@ class ReportClient:
             raise ReportError('BUSINESS_ERROR')
         data = result.get('data')
         if (not isinstance(data, dict) or data.get('fileKey') != item['file_key']
-                or data.get('rakingRecordingTaskId') != item['task_id']):
+                or data.get('recordingTaskId') != item['task_id']):
             raise ReportError('RESPONSE_IDENTITY_MISMATCH')
-        expected = {'RECORDING','PAUSED'} if phase != 'close' else {
-            'ABORTED' if item['body']['closeReason'] == 'ABORTED' else 'READY'}
+        expected = {'OPEN'} if phase != 'close' else (
+            {'ABORTED'} if item['body'].get('closeReason') == 'ABORTED' else {'READY', 'CLOSED'})
         if data.get('status') not in expected:
             raise ReportError('RESPONSE_STATUS_MISMATCH')
         if phase == 'update':
-            accepted = data.get('acceptedSequence')
+            accepted = data.get('lastSequence')
             if type(accepted) is not int or accepted < item['body']['sequence']:
                 raise ReportError('RESPONSE_SEQUENCE_MISMATCH')
         return data

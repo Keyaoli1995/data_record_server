@@ -1,101 +1,92 @@
-# 录制服务 Web 上报接入与运维
+# 录制服务 Web 上报接入与运维（ICD(2)）
 
-本功能已在本地实现，默认关闭。原始录制保持一文件一任务，空闲超时沿用 IDLE_TIMEOUT_SECONDS（默认30秒）。本地模拟测试不代表 Web 接口已发布；不得直接使用生产环境试验通知。
+当前契约以 2026-10-19 ICD V1.1（ICD(2)）为准。录制服务负责原始文件保存、统计、作业地时区和文件生命周期上报，不负责 Web 查询、地图或解析 Worker。Web 真实联调通过与本地测试通过是两回事。
 
-## 能力范围
+## 正式接口
 
-- 创建/更新/关闭按 ICD 第4.1节请求上报，稳定 fileKey、taskId、幂等键和文件内通知序号。
-- 后台扫描已落盘字节，周期统计记录数、大小、GPS min/max和最新有效固定解位置。HTTP 不在 TCP 接收线程运行。
-- SQLite outbox 保存在 `/data/reporting/outbox.sqlite3`，文件身份先于创建落盘；同文件依赖顺序发送，不同文件错误隔离。重试保持请求内容不变。
-- 网络/协议错误、429、5xx 指数退避；ICD `data.errorCode` 中明确的永久错误优先于 HTTP 状态。无法确认的响应转人工处置，绝不仅因 HTTP200 标记成功。
-- 时区确定前省略 timezone；无 GPS 的原始文件保留并 ABORTED；损坏尾部不截断修复。
-- 正常停机先持久化关闭意图，后台核验并生成结束 outbox；超过停止等待预算时保留意图，重启重建。崩溃恢复只处理已登记文件，新数据新任务。
-- 首版只提供 currentLocation，不传可选 points 数组；不承诺全量实时预览轨迹。没有人工时区覆盖入口。
+| 阶段 | 方法及路径 | 成功文件状态 |
+| --- | --- | --- |
+| 创建 | POST `/api/v2.4/manual-raking/recording-files/` | OPEN |
+| 更新 | PATCH `/api/v2.4/manual-raking/recording-files/{fileKey}/` | OPEN |
+| 结束 | PATCH `/api/v2.4/manual-raking/recording-files/{fileKey}/status/` | 正常 READY（兼容历史 CLOSED）；放弃 ABORTED |
+
+创建字段为 `recordingTaskId`、`locatorSn`、`fileKey`、`sequence`、`storageUri`、`openedAt`。不再使用旧 `rakingRecordingTaskId`、`rakingLocatorSn` 和 `schemaVersion`。更新携带统计、最新有效位置、设备数据时间和可用时区；不发送可选 points，不承诺完整实时轨迹。结束携带最终统计、摘要、原路径、关闭时间及原因，不发送 `status=FINISHED`。
+
+响应必须同时满足 HTTP 成功、整数 `code=0`、`data.recordingTaskId`/`fileKey` 对应当前文件、文件状态符合阶段；更新还要求整数 `lastSequence` 不小于请求序号。文件状态 OPEN 与任务状态 RECORDING 是不同概念。普通业务错误可为 HTTP 200、`code=-1`、`data=null`，保留队列转人工处理，不打印可能含敏感内容的 msg。已知旧结构的稳定错误码仍能识别，不依赖 Web 一定提供它们。
+
+创建序号为 1，后续快照严格递增；重试复用任务 ID、fileKey、序号和原请求体。继续发送稳定 Idempotency-Key 便于跟踪，但 ICD(2) 的 Web 不校验该头，不能依赖它去重。模拟集成测试按请求资源及 sequence 去重。
 
 ## 配置
 
-通过本地 `.env` 或部署系统注入；`.env` 已被 Git 和镜像构建忽略。下列示例没有可用凭据：
+在部署目录 `.env` 中填写；不要提交凭据：
 
 ```dotenv
-WEB_REPORTING_ENABLED=false
-WEB_BASE_URL=https://web.example.invalid
+WEB_REPORTING_ENABLED=true
+WEB_BASE_URL=https://v.bynav.com:8105
 WEB_ENVIRONMENT=test
 WEB_AUTHORIZATION=
+WEB_STORAGE_ROOT=/opt/manual_raking_trajectory/data_record_server/data
 WEB_ALLOW_HTTP=false
 WEB_UPDATE_INTERVAL_SECONDS=10
 WEB_REQUEST_TIMEOUT_SECONDS=5
 WEB_SHUTDOWN_REASON=SERVER_SHUTDOWN
 ```
 
-新版 ICD 的三个录制上报接口免登录鉴权，通过内网调用，由网络和路由 ACL 限制来源，不应暴露到公网。启用前确认内网 URL、存储根映射、三阶段接口和停机原因枚举。WEB_AUTHORIZATION 可以省略或留空，此时不发送 Authorization；仅在网关另有要求时配置完整请求头值。
+以上 URL 仅为已知测试环境示例，不能复制到生产。URL 只包含协议、主机、端口。默认验证 HTTPS 证书且不跟随重定向；确认的内网 HTTP 地址必须显式启用 WEB_ALLOW_HTTP。Web 上报免登录鉴权，Authorization 可省略，网络 ACL 由 Web 部署维护。不发送 X-Environment；WEB_ENVIRONMENT 仅与 origin 一起绑定本地队列，禁止跨环境重放。
 
-WEB_ENVIRONMENT 仍是必填的本地队列隔离标识，不会作为 X-Environment 请求头或请求参数发送。Web 的业务环境仅由其部署配置决定。创建、更新路径不变，结束路径为 POST `/api/v2.4/manual-raking/recording-files/{fileKey}/closure/`，不再调用 `/close/`。
+WEB_STORAGE_ROOT 是 **Web 与 Worker 看到的绝对路径根目录**，与录制容器内 DATA_DIR 分开。Compose 默认宿主机录制目录，非 Compose 启动未设置时使用实际 DATA_DIR 的绝对路径。若路径含 `..`、`.`、控制字符或反斜杠则拒绝启动。
 
-URL 只填 origin（协议、主机和端口），不带 `/api`、路径、查询或用户名密码。默认 HTTPS 校验证书，禁止重定向携带凭据；已确认的内网 HTTP 地址需显式 WEB_ALLOW_HTTP=true（本地模拟同样适用），默认仍只接受 HTTPS。环境和 origin 与 outbox 绑定，改变后拒绝启动，防止把积压发往其他区域；凭据轮换可保持原库重试。
+例如录制进程读写 `/data/devices/device-SN/file.jsonl`，上报 `/opt/manual_raking_trajectory/data_record_server/data/devices/device-SN/file.jsonl`。Web 和 Worker 必须把原始数据只读挂载到上报路径；它们不会自动添加根目录或替换路径。录制服务只拼接路径，不上传原始内容，也无法保证远端挂载已配置。每份文件创建时持久化 storageUri，之后配置变化只影响新文件，旧文件结束仍使用创建时路径。
 
-正常关闭原因采用 IDLE_TIMEOUT；服务停机默认 SERVER_SHUTDOWN（待 Web 确认），可以按双方认可的枚举配置。异常使用 ABORTED，不能把服务停机冒充 USER_STOPPED 或 DEVICE_SHUTDOWN。
+ICD(2) 的结束接口不读取文件、不重算 SHA256。返回 READY 仅表示 Web 接受结束信息，不能据此证明 Worker 可读或完成完整性验证。录制服务仍自行统计和核验原始字节。
 
-原始文件路径相对于 DATA_DIR。Web/Worker 必须配置同一环境的只读存储映射；相对 storageUri 不能直接交给要求绝对路径的解析脚本。服务不上传原始文件，不提供下载接口。
+## 时间和时区
 
-## 全球作业地时区
+录制协议的 gpsTime 当前按 Unix 毫秒解析。firstGpsTime、lastGpsTime 上报原始有效整数的最小/最大值，不凭位数自动除以 1000；lastReportedDataAt 和位置 recordedAt 从该毫秒值转换为 UTC ISO 时间。ICD(2) 仅规定 GPS 字段 integer，未写单位，其示例不能作为改变原始数据单位的依据。真实联调需使用已知采样验证双方含义；若 Web 最终要求秒，应另行明确转换规则和精度，不修改原始文件。
 
-使用 WGS84 `GNSSlat/GNSSlon` 和当前离线地理边界查询 IANA 名称，不根据服务器地区、系统时区或 IP 猜测。仅接受 GNSSPosStat=4、合法坐标和整数 UTC 毫秒；至少3个时间递增的合格点、跨度2秒且结果一致，才锁定本任务时区。位置含义是天线原始定位，不是杆臂修正后的轨迹。
+作业时区由固定解 WGS84 坐标在离线全球时区数据中查询；3个时间递增点、跨度至少2秒且时区一致才锁定。未确定时省略，不按服务器地区猜测。冲突仅本地审计；ICD(2) Web 不返回冲突字段。时间始终 UTC。
 
-锁定后不覆盖，冲突写入本地审计。库不可用、无合格定位或无法匹配时继续 UTC 录制和上报，不造默认时区。时间始终存 UTC，由 Web 根据 IANA 时区和实际日期转换夏令时。
+closeReason=ABORTED 表示异常放弃；IDLE_TIMEOUT、SERVER_SHUTDOWN 等其他原因按正常结束。Web 的任务正常结束为 READY，放弃为 FAILED，FINISHED 只是前端筛选别名。无有效 GPS 或损坏文件仍本地保留并上报 ABORTED。
 
-依赖锁在 requirements-reporting.txt：timezonefinder9.0.0、全球边界数据3.2026.4、tzdata2026.5。镜像 PYTHONTZPATH 为空，使用固定 tzdata 规则；开发机测试也建议设置该变量。审计保存库版本、数据版本、坐标和 GPS 时间。
+## 升级和旧队列
 
-28个地点覆盖六个有人居住的大洲和太平洋，检查非整点偏移、日期变更线、季节变化；这些回归并非全球每条边界的穷举证明。多边形采用严格包含查询并排除 Etc 海洋默认区，但边界数据包含部分领海，重叠区可能返回第一个匹配，定位噪声也会影响边界附近判定。没有额外海岸线/边界距离置信度算法。软件升级时须复核固定坐标与夏令时回归，不能宣称永远自动覆盖未来政策变更。
+升级前停止录制进程，并备份原始数据及 `/data/reporting`（包括 SQLite/WAL/SHM，或使用 SQLite 正规备份）。启动自动添加 storage_uri 列并保留所有身份、请求体和幂等键。
 
-timezonefinder 代码为 MIT，边界数据为 ODbL-1.0（来源 OpenStreetMap/timezone-boundary-builder）；发布镜像保留依赖自带许可。离线代码和地理数据约34MiB，完整 Python依赖另计。
+旧创建请求使用 rakingRecordingTaskId 的未完成文件会置为 ERROR，错误为 `LEGACY_ICD_RECONCILIATION_REQUIRED`，不自动重放、不删除文件，也不影响新文件。即使旧请求曾被标记 SENT，也不能证明它与新响应契约一致，因此需要与 Web 对账。已完成 DONE 的历史记录保持原状态。普通 retry 不能解除该隔离，不能通过新建 ID 冒充一次新录制；确认远端接收情况后需制定单独迁移步骤。
 
-## 查看、补发和历史补录
-
-启用前需使 `/data/reporting` 可被容器用户10001写入，与归档共用持久化卷。SQLite数据库及 WAL/SHM 必须一起按 SQLite 正规备份流程处理，不能仅复制运行中的主文件。单个 DATA_DIR 只允许一个上报进程，使用 flock 防止第二个进程误恢复仍在录制的文件。
-
-查看状态只读，可在服务运行时执行：
+## 查看和维护
 
 ```bash
-python -m data_record_server.reporting_admin status
+docker compose exec collector python -m data_record_server.reporting_admin status
 ```
 
-需使用相同 DATA_DIR。输出仅包含文件、阶段、状态、重试次数及错误码，不包含鉴权值。
-
-修复鉴权或配置后，停止该 DATA_DIR 的录制进程，再用相同配置执行：
+状态查询只读。可重试的网络/429/5xx 自动退避，普通业务失败及未知响应隔离。修复后先停止录制服务，再用同配置离线执行：
 
 ```bash
-python -m data_record_server.reporting_admin retry --file-key FILE_KEY
+docker compose stop collector
+docker compose run --rm --no-deps collector python -m data_record_server.reporting_admin retry --file-key FILE_KEY
+docker compose up -d --no-build collector
 ```
 
-随后启动服务继续发送。该命令不自行发送 HTTP，不修改原始文件，不解除 Web TIMEOUT/AlreadyFinished。远端终态需要 Web 对账或双方确认的恢复流程，不能通过换 ID 偷换为新文件。
+远端已终态或本地 ERROR 文件不能普通重试。工具不会自动修复 Web 文件、回滚任务或修改原始文件。
 
-历史文件显式补录也必须先停止进程，核实文件确已结束、原始 SN 和事件时间。时间参数必须为 UTC，不能以 gpsTime 冒充服务器事件时间：
+历史补录需要明确原 SN 和有依据的 UTC 开始/结束时间，在服务停止后执行：
 
 ```bash
-python -m data_record_server.reporting_admin import \
-  --path devices/device-BY80126B66/record.jsonl \
-  --device-id BY80126B66 \
-  --opened-at 2026-10-15T02:00:00Z \
-  --closed-at 2026-10-15T03:00:00Z \
+docker compose run --rm --no-deps collector python -m data_record_server.reporting_admin import \
+  --path devices/device-SN/file.jsonl --device-id SN \
+  --opened-at 2026-10-19T02:00:00Z --closed-at 2026-10-19T03:00:00Z \
   --reason IDLE_TIMEOUT
 ```
 
-该命令只登记和生成通知，重复导入同路径返回原标识。开始/结束事件时间必须有依据；未知历史事件时间不要编造。正常导入必须有有效 GPS 和完整记录；异常归档需显式 ABORTED。录制中的文件、外部路径、任意二进制均不应导入。
+--path 仍是相对于 DATA_DIR 的本地路径，发布时转换为 WEB_STORAGE_ROOT 下路径。缺文件、越界或损坏记录保留 ERROR，不用改原始数据掩盖问题。待补发及 ERROR 文件受保留清理保护，应监控磁盘。队列日志输出数量、年龄和字节数，状态命令显示需对账的 fileKey。
 
-每分钟日志包含队列状态/数量、最老等待秒数、请求体字节数和受保护原始文件字节数。未确认通知及需人工处理的文件不会被保留清理自动删除，应监控磁盘；已发送 outbox 当前保留用于审计，不自动压缩清除。
+## 本地验证
 
-缺文件、损坏或路径异常记录会保留 ERROR 状态和原文件。不要编辑原文件来掩盖错误；恢复缺失文件后如何重新纳入索引需维护人员与 Web 确认。本工具不提供覆盖已归档文件或解除远端终态的强制开关。
-
-## 验证与发布前提
+使用 Python 3.12 的隔离环境安装 requirements-reporting.txt 和 requirements-dev.txt，然后执行：
 
 ```bash
-python3.12 -m venv .venv
-.venv/bin/python -m pip install -r requirements-reporting.txt PyYAML
-env -u PYTHONPATH PYTHONTZPATH='' .venv/bin/python -m unittest discover -s tests -v
+env -u PYTHONPATH PYTHONTZPATH='' .venv/bin/python -m unittest discover -s tests -q
 ```
 
-测试包括真实本地 TCP/HTTP、丢失响应后的重启补发、完整性与队列状态验证。日志中模拟 NETWORK_ERROR/停机超时等为测试预期故障。
-
-本次环境 Docker Desktop 未启用 WSL 集成，不能执行实际镜像构建和容器启动；Dockerfile/Compose契约已由测试校验，Python3.12隔离环境的依赖已实际安装。部署环境仍需执行 `docker compose build`、非 root持久化写入、原始存储挂载和 Web真实接口联调。
-
-本次最终本地回归：167项全部通过（Python3.12，包含原有100项）；依赖检查通过。
+部署须使用新镜像；仅修改 .env 不能更新旧客户端。正式启用后分别验证创建、更新和结束响应，再验证 Worker 读取原路径。OPTIONS 返回200不代表文件全流程联调通过。

@@ -27,26 +27,26 @@ class ReportingIntegrationTest(unittest.TestCase):
                 self_test.assertIsNone(self.headers.get('Authorization'))
                 self_test.assertIsNone(self.headers.get('X-Environment'))
                 body=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-                key=self.headers['Idempotency-Key']
+                key=(self.command, self.path, body['sequence'])
                 if key in seen:
                     if seen[key][0] != body: raise AssertionError('retry mutated payload')
                     response=seen[key][1]
                 else:
-                    if self.path.endswith('/closure/'):
+                    if self.path.endswith('/status/'):
                         file_key=self.path.split('/')[-3];status='READY'
                     elif self.command=='PATCH':
-                        file_key=self.path.split('/')[-2];status='RECORDING'
+                        file_key=self.path.split('/')[-2];status='OPEN'
                     else:
-                        file_key=body['fileKey'];status='RECORDING'
-                    task_id=body.get('rakingRecordingTaskId') or accepted[0][1]['rakingRecordingTaskId']
-                    response=dict(code=0,data=dict(fileKey=file_key,rakingRecordingTaskId=task_id,
-                        status=status,acceptedSequence=body['sequence']))
+                        file_key=body['fileKey'];status='OPEN'
+                    task_id=body.get('recordingTaskId') or accepted[0][1]['recordingTaskId']
+                    response=dict(code=0,data=dict(fileKey=file_key,recordingTaskId=task_id,
+                        status=status,lastSequence=body['sequence']))
                     seen[key]=(body,response);accepted.append((self.path,body))
                 if lose_first[0]:
                     lose_first[0]=False;self.close_connection=True;return
                 encoded=json.dumps(response).encode();self.send_response(200)
                 self.send_header('Content-Length',str(len(encoded)));self.end_headers();self.wfile.write(encoded)
-                if self.path.endswith('/closure/'):finished.set()
+                if self.path.endswith('/status/'):finished.set()
         http=ThreadingHTTPServer(('127.0.0.1',0),Handler)
         ht=threading.Thread(target=http.serve_forever,daemon=True);ht.start()
         try:
@@ -85,6 +85,12 @@ class ReportingIntegrationTest(unittest.TestCase):
                     for _ in range(4):recovered.worker.deliver()
                     self.assertTrue(finished.wait(2))
                     self.assertEqual(len(accepted),3)
+                    self.assertLess(accepted[0][1]['sequence'], accepted[1][1]['sequence'])
+                    self.assertLess(accepted[1][1]['sequence'], accepted[2][1]['sequence'])
+                    self.assertEqual('D1', accepted[0][1]['locatorSn'])
+                    self.assertTrue(Path(accepted[0][1]['storageUri']).is_absolute())
+                    self.assertEqual(accepted[0][1]['storageUri'], accepted[2][1]['storageUri'])
+                    self.assertNotIn('status', accepted[2][1])
                     close=accepted[-1][1]
                     self.assertEqual(close['sizeBytes'],len(data))
                     self.assertEqual(close['sha256'],hashlib.sha256(data).hexdigest())

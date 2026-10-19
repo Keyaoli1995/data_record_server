@@ -19,9 +19,12 @@ class AdminTest(unittest.TestCase):
         path.write_bytes(b'{"deviceId":"D1","gpsTime":1000}\n')
         args=['import','--path','devices/device-D1/old.jsonl','--device-id','D1',
               '--opened-at','2026-10-15T00:00:00Z','--closed-at','2026-10-15T00:01:00Z','--reason','IDLE_TIMEOUT']
-        with contextlib.redirect_stdout(io.StringIO()):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
             self.assertEqual(reporting_admin.run(args,self.root,self.config),0)
             self.assertEqual(reporting_admin.run(args,self.root,self.config),0)
+        self.assertIn('"recordingTaskId"', output.getvalue())
+        self.assertNotIn('"rakingRecordingTaskId"', output.getvalue())
         service=ReportingService(self.root,self.config);self.addCleanup(service.stop)
         self.assertEqual(len(service.store.recordings()),1)
         self.assertEqual(service.store.recordings()[0]['state'],'FINALIZED')

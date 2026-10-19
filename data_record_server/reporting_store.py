@@ -20,10 +20,11 @@ def safe_relative_path(value):
 
 
 class ReportStore:
-    def __init__(self, path, environment, origin):
+    def __init__(self, path, environment, origin, storage_root=None):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._storage_root = Path(storage_root).resolve() if storage_root is not None else None
         self._db = sqlite3.connect(path, check_same_thread=False, timeout=5)
         self._db.row_factory = sqlite3.Row
         try:
@@ -47,7 +48,18 @@ class ReportStore:
             columns = {row[1] for row in self._db.execute('PRAGMA table_info(outbox)')}
             if 'created_at' not in columns:
                 self._db.execute('ALTER TABLE outbox ADD COLUMN created_at REAL NOT NULL DEFAULT 0')
+            recording_columns = {row[1] for row in self._db.execute('PRAGMA table_info(recordings)')}
+            if 'storage_uri' not in recording_columns:
+                self._db.execute('ALTER TABLE recordings ADD COLUMN storage_uri TEXT')
             with self._db:
+                # Preserve old request bodies and identities. Their acceptance by Web is
+                # unknown, so an upgrade must not silently rewrite and replay them.
+                for item in self._db.execute("SELECT file_key,body FROM outbox WHERE phase='create'").fetchall():
+                    body = json.loads(item['body'])
+                    self._db.execute('UPDATE recordings SET storage_uri=COALESCE(storage_uri,?) WHERE file_key=?',
+                                     (body.get('storageUri'), item['file_key']))
+                    if 'recordingTaskId' not in body:
+                        self._db.execute("UPDATE recordings SET state='ERROR',error='LEGACY_ICD_RECONCILIATION_REQUIRED' WHERE file_key=? AND state!='DONE'", (item['file_key'],))
                 for key, value in (('environment', environment), ('origin', origin), ('schema', '1')):
                     old = self._db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
                     if old and old[0] != value:
@@ -72,11 +84,12 @@ class ReportStore:
                     raise ValueError('file already registered to another device')
                 return dict(row)
             file_key, task_id = uuid.uuid4().hex, uuid.uuid4().hex
-            self._db.execute('INSERT INTO recordings(file_key,task_id,path,device_id,opened_at) VALUES (?,?,?,?,?)',
-                             (file_key, task_id, path, device_id, opened_at))
-            self._insert(file_key, 'create', dict(schemaVersion=1, rakingRecordingTaskId=task_id,
-                         fileKey=file_key, rakingLocatorSn=device_id, sequence=1,
-                         storageUri=path, openedAt=opened_at))
+            storage_uri = str(self._storage_root / path) if self._storage_root is not None else path
+            self._db.execute('INSERT INTO recordings(file_key,task_id,path,device_id,opened_at,storage_uri,sequence) VALUES (?,?,?,?,?,?,1)',
+                             (file_key, task_id, path, device_id, opened_at, storage_uri))
+            self._insert(file_key, 'create', dict(recordingTaskId=task_id,
+                         fileKey=file_key, locatorSn=device_id, sequence=1,
+                         storageUri=storage_uri, openedAt=opened_at))
             return dict(self._db.execute('SELECT * FROM recordings WHERE file_key=?', (file_key,)).fetchone())
 
     def _insert(self, file_key, phase, body):
@@ -99,7 +112,7 @@ class ReportStore:
                     (file_key,)).fetchone():
                 return False
             sequence = row['sequence'] + 1
-            payload = dict(body, schemaVersion=1, sequence=sequence)
+            payload = dict(body, sequence=sequence)
             self._insert(file_key, phase, payload)
             self._db.execute('UPDATE recordings SET sequence=?,last_size=?,timezone_audit=COALESCE(?,timezone_audit),state=? WHERE file_key=?',
                              (sequence, body.get('sizeBytes', row['last_size']),
@@ -147,6 +160,8 @@ class ReportStore:
 
     def retry_blocked(self, file_key):
         with self._lock, self._db:
+            if self._db.execute("SELECT 1 FROM recordings WHERE file_key=? AND state='ERROR'", (file_key,)).fetchone():
+                raise ValueError('recording requires reconciliation before retry')
             if self._db.execute("SELECT 1 FROM outbox WHERE file_key=? AND error IN ('RakingRecordingTaskTimedOut','RakingFileAlreadyFinished')", (file_key,)).fetchone():
                 raise ValueError('remote terminal task requires Web reconciliation, not ordinary retry')
             if not self._db.execute('SELECT 1 FROM recordings WHERE file_key=?', (file_key,)).fetchone():

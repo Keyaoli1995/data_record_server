@@ -7,6 +7,8 @@ import threading
 from importlib.metadata import version
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .gnss_values import normalize_record
+
 
 _LOGGER = logging.getLogger(__name__)
 _FINDER = None
@@ -102,7 +104,11 @@ class WorksiteTimezone:
             return self._finder.certain_timezone_at(lat=lat, lng=lon)
 
     def observe(self, record: dict) -> None:
-        if not isinstance(record, dict) or not self._eligible(record):
+        if not isinstance(record, dict):
+            self._reset_candidate()
+            return
+        record = normalize_record(record)
+        if not self._eligible(record):
             self._reset_candidate()
             return
         timestamp = record["gpsTime"]

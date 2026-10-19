@@ -6,9 +6,9 @@
 
 依据《人工耙沙录制轨迹 Web 端接口控制文档（ICD）》第 4.1 节，以及本轮用户确认。ICD 来源：`E:/Work/Document/08_定位棒/人工耙沙轨迹_web端发入/人工耙沙录制轨迹Web端接口控制文档ICD.md`。
 
-**已确认：一份录制文件对应一个录制任务。** 首次有效记录产生文件和新任务 ID；沿用现有设备级会话，默认 30 秒无有效记录关闭文件；关闭即本地任务结束；之后收到数据创建新文件、新任务。TCP 重连未达到会话超时则继续原文件。一个任务的文件顺序恒为 1。
+**已确认：一份录制文件对应一个录制任务。** 首次有效记录产生文件和新任务 ID；沿用现有设备级会话，默认 30 秒无有效记录关闭文件；关闭即本地任务结束；之后收到数据创建新文件、新任务。TCP 重连未达到会话超时则继续原文件。创建请求序号为1，后续快照严格递增；一个文件对应一个任务。
 
-Web 需确认：唯一文件正常结束并校验为 READY 后，将所属任务标记 FINISHED。此项是联调前提，不能假设 Web 已实现。
+ICD(2)：文件初始状态 OPEN，正常结束 READY（历史 CLOSED 兼容）；任务正常结束 READY、异常放弃 FAILED。FINISHED 仅为前端过滤别名。Web 结束接口不验证文件内容。
 
 本次负责录制、统计、创建/更新/关闭通知、可靠补发和作业地时区识别；不改解析脚本，不实现 Web 索引、实时流、地图管理，不在本次文档任务中部署或推送。
 
@@ -26,27 +26,27 @@ Web 需确认：唯一文件正常结束并校验为 READY 后，将所属任务
 
 ## 3. 任务和文件身份
 
-创建文件时生成并持久化两项独立 UUID 标识：`rakingRecordingTaskId`、`fileKey`，使用 URL 安全字符串。重试和重启不得重新生成。SN 直接使用文件 deviceId，不推断机器人 SN。
+创建文件时生成并持久化两项独立 UUID 标识：`recordingTaskId`、`fileKey`，使用 URL 安全字符串。重试和重启不得重新生成。SN 直接使用文件 deviceId，不推断机器人 SN。
 
 创建请求中的 `sequence=1` 是文件在任务中的顺序；更新/结束中的 sequence 是该文件的通知版本，单独计数，不混用。更新从 1 递增，关闭使用新的更大序号。通知内容和幂等键一旦进入发送队列不可修改。
 
-`storageUri` 使用文件相对 DATA_DIR 的 POSIX 路径，例如 `devices/device-BY80126B66/<原文件名>.jsonl`。Web/Worker 将此映射到各自挂载根目录；不发送绝对路径、账号或下载 URL。
+本地 path 保留相对 DATA_DIR 的 POSIX 路径。发布 storageUri 为 WEB_STORAGE_ROOT 与本地 path 拼接后的绝对路径；Web/Worker 按原值读取，不做重写。Compose 默认发布宿主机目录，必须由 Web 配置同路径只读挂载。每个文件创建时固定并持久化发布路径。
 
 ## 4. 三阶段请求
 
 所有路径相对已配置 Web 根地址，禁止重复追加 `/api`。
 
-| 阶段 | 方法与路径 | 必填业务字段 |
+| 阶段 | 方法与路径 | 本服务上报字段 |
 | --- | --- | --- |
-| 创建 | POST `/api/v2.4/manual-raking/recording-files/` | schemaVersion=1、rakingRecordingTaskId、fileKey、rakingLocatorSn、sequence=1、storageUri、openedAt |
-| 更新 | PATCH `/api/v2.4/manual-raking/recording-files/{fileKey}/` | schemaVersion=1、sequence、updatedAt、recordCount、sizeBytes |
-| 结束 | POST `/api/v2.4/manual-raking/recording-files/{fileKey}/closure/` | schemaVersion=1、sequence、closedAt、firstGpsTime、lastGpsTime、recordCount、sizeBytes、storageUri、sha256、closeReason |
+| 创建 | POST `/api/v2.4/manual-raking/recording-files/` | recordingTaskId、fileKey、locatorSn、sequence=1、storageUri、openedAt |
+| 更新 | PATCH `/api/v2.4/manual-raking/recording-files/{fileKey}/` | sequence、recordCount、sizeBytes |
+| 结束 | PATCH `/api/v2.4/manual-raking/recording-files/{fileKey}/status/` | sequence、closedAt、firstGpsTime、lastGpsTime、recordCount、sizeBytes、storageUri、sha256、closeReason |
 
 各阶段可携带 timezone；创建可带 firstGpsTime；更新可带 lastGpsTime、lastReportedDataAt、currentLocation。首版建议上报最新位置，不上传可选 points 数组；因此不承诺完整实时轨迹历史，若 Web 需要该能力，应单独确认采样频率和可靠传输范围。
 
 所有请求发送 `Content-Type: application/json` 和稳定的 `Idempotency-Key`，不发送 `X-Environment`。Web 环境由部署配置决定，本地 `WEB_ENVIRONMENT` 仅用于队列隔离。默认不发送 Authorization；可选网关鉴权通过独立配置注入，不在队列和日志中保存凭据。三个免鉴权接口仅允许内网调用，网络与反向代理负责来源限制。
 
-成功需要 HTTP 成功、响应 JSON `code=0`、身份和状态与请求匹配。创建/更新只确认已接受；正常关闭需 READY，异常关闭需 ABORTED。HTTP 200 本身不是成功；未知响应保留通知并告警。
+成功需要 HTTP 成功、响应 JSON `code=0`、身份和状态与请求匹配。创建/更新只确认已接受；创建/更新文件状态需 OPEN，正常关闭需 READY（兼容 CLOSED），异常关闭需 ABORTED；核对 recordingTaskId、fileKey，更新核对 lastSequence。HTTP 200 本身不是成功；未知响应保留通知并告警。
 
 ## 5. 数据统计与时间
 
@@ -108,7 +108,7 @@ Web 任务超时是远端终态：收到 TIMEOUT 不换 ID 重复上报旧文件
 
 ## 9. 联调前的外部确认项
 
-1. 唯一文件 READY 后所属任务进入 FINISHED；ABORTED 如何结束任务。
+1. ICD(2) 已明确任务正常 READY、放弃 FAILED；部署环境需核实实际返回。
 2. 各环境地址、服务鉴权方式、成功响应和错误码的正式契约。
 3. 正常服务停机原因枚举、GPS 范围采用 min/max、time/coordinate 字段缺失处理。
 4. Web 超时后的补录流程，以及同文件标识重试/修复 INVALID 的规则。
@@ -124,11 +124,17 @@ Web 任务超时是远端终态：收到 TIMEOUT 不换 ID 重复上报旧文件
 - 当前采用后台增量扫描已落盘数据，TCP追加路径不执行HTTP和地理查询。关闭后完整复核原字节。
 - 时区库使用 timezonefinder9.0.0，独立全球边界数据3.2026.4，tzdata2026.5；同时记录库和数据版本。全球28个代表地点及边界候选、海洋、夏令时等回归属于典型场景验证，不代表全球每个点均被验证。
 - “严格陆地”要求在实现中具体为严格多边形包含并排除 Etc 海洋默认区。所用数据包含部分领海，重叠边界沿用数据集首个匹配；没有海岸线校验或距离边界置信区间。因此不能承诺所有边界附近结果一定为空，文档和 Web 提示应保留这项限制。
-- Web ICD第6节业务错误包装为外层 code=40001、data.errorCode为稳定业务码；已按此格式识别终态，并支持HTTP错误时优先读取已知业务错误。
+- ICD(2) 普通业务错误为 code=-1、msg、data=null，保留队列转人工处理；仍兼容旧稳定错误码，但不依赖后端提供它们。
 - 位置缺少高度或精度时不编造数值；当前上报位置可省略对应字段，需 Web 对 currentLocation 子字段的可空性确认。
 - 停机在有限等待内尽量生成最终 outbox；大文件扫描超过预算时已持久化 CLOSED 意图，后台继续收尾，若进程被终止则重启恢复。不能为等待 Web 而无限阻塞停机。
 - 运行配置、历史补录、积压查询和限制见 [接入与运维](../../web-reporting-operations.md)。
 
-## 新版 ICD 适配说明（2026-10-16）
+## 历史 ICD 适配说明（2026-10-16，已由下节取代）
 
 按用户提供的新版 ICD 第4.0～4.1节调整结束路径、可选鉴权与环境请求头。保持一文件一任务、全球作业地时区、统计字段、幂等补发和恢复语义不变；points 仍为可选且暂不发送。本次附件到第4.3.1节请求示例结束，不据此修改未提供的解析脚本契约。已有队列身份及请求体不变，发送端采用新路径；已被旧路径错误阻塞的请求需排查后按运维步骤重试，不能自动解除远端终态。
+
+## ICD(2) 完整适配（2026-10-19，优先于历史说明）
+
+正式结束路径为 PATCH /status/，不调用 /closure/。不发送 schemaVersion 或 status=FINISHED。Web 不实现 Idempotency-Key 去重，依赖稳定文件和序号；队列重放保持原内容。code=-1/data=null 是业务失败，不能当作成功或根据任意 msg 自动恢复。
+
+旧协议未完成队列保留并隔离为 LEGACY_ICD_RECONCILIATION_REQUIRED，不改写历史请求；与 Web 对账后另行迁移。GPS 字段保留原始整数，当前录制源单位为毫秒；ICD(2) 未指定单位，不能把其示例解释成已确认毫秒约定。Web 不记录时区冲突，本地仍审计。配置及升级步骤见 ../../web-reporting-operations.md。

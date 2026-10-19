@@ -33,7 +33,8 @@ class ReportingService:
                 fcntl.flock(self._lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise RuntimeError('another reporting process owns DATA_DIR') from None
-            self.store = ReportStore(directory / 'outbox.sqlite3', config.environment, config.base_url)
+            self.store = ReportStore(directory / 'outbox.sqlite3', config.environment, config.base_url,
+                                     storage_root=config.storage_root or self.root)
             self.store.recover(self.clock().isoformat().replace('+00:00','Z'), config.shutdown_reason)
             self.worker = ReportWorker(self.root, self.store, config, ReportClient(config), clock=self.clock)
             self.worker.before_prepare = self.flush_closures

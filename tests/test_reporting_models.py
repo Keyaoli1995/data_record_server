@@ -55,7 +55,7 @@ class FileStatsTest(unittest.TestCase):
         self.assertEqual(self.stats.snapshot()['recordCount'], 1)
 
     def test_bad_gps_is_not_replaced_with_server_time(self):
-        self.write([{'deviceId':'D1', 'gpsTime':v} for v in (True, -1, '1000', 1e300, None)])
+        self.write([{'deviceId':'D1', 'gpsTime':v} for v in (True, -1, '1000.5', 1e300, None)])
         self.stats.scan(self.path, final=True)
         self.assertEqual(self.stats.snapshot()['recordCount'], 5)
         self.assertIsNone(self.stats.snapshot()['firstGpsTime'])
@@ -89,3 +89,20 @@ class FileStatsTest(unittest.TestCase):
 
     def test_gps_upper_bound_preserves_millisecond(self):
         self.assertEqual(reporting_models.gps_iso(253402300799999),'9999-12-31T23:59:59.999Z')
+
+    def test_device_numeric_strings_preserve_bytes_and_resolve_location(self):
+        from data_record_server.worksite_timezone import WorksiteTimezone
+        stats = reporting_models.FileStats('D1', WorksiteTimezone(lambda lat, lon: 'Asia/Shanghai'))
+        raw = self.write([dict(deviceId='D1', gpsTime=str(t), GNSSlat='28.2000',
+                               GNSSlon='112.8000', GNSShigh='-12.50', GNSSPosStat='4')
+                          for t in (1792425705478, 1792425706478, 1792425707478)])
+        stats.scan(self.path, final=True)
+        self.assertTrue(stats.valid)
+        result = stats.snapshot()
+        self.assertEqual(result['firstGpsTime'], 1792425705478)
+        self.assertEqual(result['lastGpsTime'], 1792425707478)
+        self.assertEqual(result['currentLocation']['latitude'], 28.2)
+        self.assertEqual(result['currentLocation']['altitudeMeters'], -12.5)
+        self.assertEqual(result['timezone'], 'Asia/Shanghai')
+        self.assertEqual(self.path.read_bytes(), raw)
+        self.assertEqual(stats.sha256, hashlib.sha256(raw).hexdigest())

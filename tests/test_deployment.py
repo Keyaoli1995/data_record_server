@@ -109,6 +109,7 @@ class DeploymentFilesTest(unittest.TestCase):
                 "RETENTION_DAYS": "${RETENTION_DAYS:-30}",
                 "WEB_REPORTING_ENABLED": "${WEB_REPORTING_ENABLED:-false}",
                 "WEB_BASE_URL": "${WEB_BASE_URL:-}",
+                "WEB_STORAGE_ROOT": "${WEB_STORAGE_ROOT:-/opt/manual_raking_trajectory/data_record_server/data}",
                 "WEB_ENVIRONMENT": "${WEB_ENVIRONMENT:-}",
                 "WEB_AUTHORIZATION": "${WEB_AUTHORIZATION:-}",
                 "WEB_ALLOW_HTTP": "${WEB_ALLOW_HTTP:-false}",

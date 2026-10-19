@@ -1,3 +1,5 @@
+> 2026-10-19：本文原实施记录为历史版本；当前协议和升级规则以 [运维说明](../../web-reporting-operations.md) 的 ICD(2) 章节为准。
+
 # 录制服务 Web 上报实现计划
 
 > **For agentic workers:** 使用 superpowers:executing-plans 逐项执行本计划；未经新授权不部署、不推送。
@@ -127,3 +129,15 @@
 - 详细配置、可重试/人工处理错误及补录命令见 [接入与运维](../../web-reporting-operations.md)。
 
 最终本地验证：`env -u PYTHONPATH PYTHONTZPATH='' /tmp/wayrobo-timezone312/bin/python -m unittest discover -s tests -q`，167项全部通过（23.247秒）；`pip check`、`git diff --check`通过。
+
+## ICD(2) 修订实施记录（2026-10-19）
+
+- 已按 Red/Green 验证请求字段、响应 OPEN/lastSequence、PATCH status 结束路径。
+- 已验证创建序号1、后续严格递增；模拟 Web 按资源和序号去重，响应丢失后重启补发不改请求。
+- 已增加 WEB_STORAGE_ROOT，创建时持久化 storageUri，重启或根目录调整后不改变既有文件路径；本地 path 仍受目录越界检查保护。
+- 旧协议未完成请求隔离为 LEGACY_ICD_RECONCILIATION_REQUIRED，原身份和请求内容保留，普通 retry 拒绝解除，原始数据继续受保留保护。
+- 已同步运维说明和设计说明，历史补录输出统一使用 recordingTaskId。
+- Python3.12 隔离环境全量177项通过；补录输出字段修订后4项管理员测试通过；pip check、git diff --check 通过。
+- 后续已部署测试环境，修复设备 GPS 时间、经纬度及高度的数字字符串兼容问题；原始文件保持不变，GPS 整数不缩放。
+- 修复后全量182项测试通过；第三组真实文件799条记录校验通过，位置和 Asia/Shanghai 时区识别成功，文件哈希未改变。
+- 测试部署版本 numeric-bb88e540，用户重新录制后反馈成功；旧三组记录未重新上报。中国生产与 Web 挂载未在本次修改。

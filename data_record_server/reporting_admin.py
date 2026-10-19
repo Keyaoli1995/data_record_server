@@ -65,7 +65,7 @@ def run(argv, root, config):
             row = service.register(args.path, args.device_id, args.opened_at)
             service.store.mark_closed(args.path, args.reason, args.closed_at)
             service.worker.prepare()
-            print(json.dumps({'fileKey':row['file_key'],'rakingRecordingTaskId':row['task_id']}))
+            print(json.dumps({'fileKey':row['file_key'],'recordingTaskId':row['task_id']}))
     finally:
         service.stop()
     return 0
