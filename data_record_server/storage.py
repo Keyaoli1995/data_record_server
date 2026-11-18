@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import BinaryIO, Callable, Dict, Optional, Set, Tuple
 from urllib.parse import quote_from_bytes
 
+from .canonicalize import canonicalize_jsonl_files
+
 Clock = Callable[[], datetime]
 ClientAddress = Tuple[str, int]
 
@@ -40,7 +42,7 @@ class JsonlEventWriter:
 
 
 class DeviceSession:
-    """One open JSONL stream shared by all clients of one device."""
+    """One device preview stream plus lossless per-client JSONL archives."""
 
     def __init__(
         self,
@@ -49,13 +51,20 @@ class DeviceSession:
         stream: BinaryIO,
         events: JsonlEventWriter,
         reporting=None,
+        data_dir: Optional[Path] = None,
+        opened_at: Optional[datetime] = None,
     ) -> None:
         self._reporting = reporting
         self.device_id = device_id
         self.relative_path = relative_path
         self._stream = stream
         self._events = events
+        self._data_dir = Path(data_dir) if data_dir is not None else None
+        self._opened_at = opened_at
+        self._session_id = uuid.uuid4().hex
         self._attached_clients: Set[ClientAddress] = set()
+        self._raw_streams: Dict[ClientAddress, BinaryIO] = {}
+        self._raw_paths: Dict[ClientAddress, Path] = {}
         self._total_bytes = 0
         self._last_valid_record_at: Optional[datetime] = None
         self._closed = False
@@ -64,10 +73,11 @@ class DeviceSession:
     def append(
         self, client_address: ClientAddress, raw_line: bytes, recorded_at: datetime
     ) -> None:
-        """Append one valid record, recording a client's first attachment."""
+        """Append one valid record to the preview and its connection archive."""
         with self._lock:
             if self._closed:
                 raise RuntimeError("cannot append to a closed device session")
+            raw_stream = self._raw_stream_for(client_address, recorded_at)
             if client_address not in self._attached_clients:
                 client_ip, client_port = client_address
                 self._events.write(
@@ -81,10 +91,45 @@ class DeviceSession:
                     }
                 )
                 self._attached_clients.add(client_address)
+            raw_stream.write(raw_line)
+            raw_stream.flush()
             self._stream.write(raw_line)
             self._stream.flush()
             self._total_bytes += len(raw_line)
             self._last_valid_record_at = recorded_at
+
+    def active_archive_paths(self) -> Set[str]:
+        """Return relative paths that must not be removed while recording."""
+        with self._lock:
+            paths = {self.relative_path}
+            paths.update(
+                path.relative_to(self._data_dir).as_posix()
+                for path in self._raw_paths.values()
+                if self._data_dir is not None
+            )
+            return paths
+
+    def _raw_stream_for(
+        self, client_address: ClientAddress, recorded_at: datetime
+    ) -> BinaryIO:
+        existing = self._raw_streams.get(client_address)
+        if existing is not None:
+            return existing
+        if self._data_dir is None:
+            raise RuntimeError("connection archive directory is unavailable")
+        client_ip, client_port = client_address
+        safe_client_ip = client_ip.replace(":", "_")
+        timestamp = recorded_at.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        directory = self._data_dir / "connections"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / (
+            f"{timestamp}_{self._session_id}_{safe_client_ip}_{client_port}_"
+            f"{uuid.uuid4().hex[:8]}.jsonl"
+        )
+        stream = path.open("xb")
+        self._raw_streams[client_address] = stream
+        self._raw_paths[client_address] = path
+        return stream
 
     def close_if_expired(
         self, now: datetime, idle_timeout_seconds: float
@@ -134,10 +179,13 @@ class DeviceSession:
                 return
             self._closed = True
             self._stream.close()
+            for stream in self._raw_streams.values():
+                stream.close()
 
     def _close_locked(self, reason: str, closed_at: datetime) -> None:
         self._closed = True
         close_error = None  # type: Optional[BaseException]
+        canonical_result = None
         try:
             if self._reporting is not None:
                 self._stream.flush()
@@ -149,21 +197,61 @@ class DeviceSession:
         except BaseException as error:
             if close_error is None:
                 close_error = error
+        for stream in self._raw_streams.values():
+            try:
+                stream.flush()
+                os.fsync(stream.fileno())
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+            try:
+                stream.close()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+        if close_error is None and self._raw_paths and self._opened_at is not None:
+            try:
+                quarantine_path = (
+                    self._data_dir / "connections" / "quarantine" /
+                    f"{self._session_id}.jsonl"
+                )
+                canonical_result = canonicalize_jsonl_files(
+                    self._raw_paths.values(),
+                    Path(self._data_dir) / self.relative_path,
+                    quarantine_path,
+                    opened_at=self._opened_at,
+                    closed_at=closed_at,
+                    tolerance=timedelta(minutes=5),
+                )
+                # Keep compatibility with diagnostic/test records that do not
+                # contain gpsTime: the arrival-order preview remains the file.
+                if canonical_result.record_count == 0:
+                    quarantine_path.unlink(missing_ok=True)
+            except BaseException as error:
+                close_error = error
         if self._reporting is not None:
             self._reporting.closed(self.relative_path,
                                    "handler_error" if close_error else reason,
                                    format_time(closed_at))
         try:
-            self._events.write(
-                {
-                    "event": "session_closed",
-                    "time": format_time(closed_at),
-                    "file": self.relative_path,
-                    "device_id": self.device_id,
-                    "total_bytes": self._total_bytes,
-                    "reason": reason,
-                }
-            )
+            event = {
+                "event": "session_closed",
+                "time": format_time(closed_at),
+                "file": self.relative_path,
+                "device_id": self.device_id,
+                "total_bytes": self._total_bytes,
+                "reason": reason,
+            }
+            if canonical_result is not None:
+                event.update(
+                    {
+                        "canonical_record_count": canonical_result.record_count,
+                        "canonical_quarantined_count": canonical_result.quarantined_count,
+                        "canonical_duplicate_count": canonical_result.duplicate_count,
+                        "raw_connection_count": len(self._raw_paths),
+                    }
+                )
+            self._events.write(event)
         except BaseException as error:
             if close_error is None:
                 close_error = error
@@ -394,9 +482,9 @@ class Storage:
     ) -> None:
         """Remove inactive archives per archive kind's own retention period."""
         with self._sessions_lock:
-            active_session_paths = {
-                session.relative_path for session in self._sessions.values()
-            }
+            active_session_paths = set()
+            for session in self._sessions.values():
+                active_session_paths.update(session.active_archive_paths())
         with self._rejected_paths_lock:
             active_paths = active_session_paths | set(self._active_rejected_paths)
 
@@ -517,14 +605,16 @@ class Storage:
     def _connection_archive_paths(self):
         connections_directory = self._data_dir / "connections"
         if self._is_real_directory(connections_directory):
-            yield from connections_directory.glob("*.bin")
+            yield from connections_directory.glob("**/*.bin")
+            yield from connections_directory.glob("**/*.jsonl")
 
     def _create_session(self, device_id: str) -> DeviceSession:
         escaped_device_id = quote_from_bytes(
             device_id.encode("utf-8", "surrogatepass"), safe=""
         )
         directory = self._data_dir / "devices" / ("device-" + escaped_device_id)
-        timestamp = format_time(self._clock())
+        created_at = self._clock()
+        timestamp = format_time(created_at)
         filename = "{}_{}_{}.jsonl".format(
             timestamp, escaped_device_id, uuid.uuid4().hex[:8]
         )
@@ -535,7 +625,15 @@ class Storage:
         if self.reporting is not None:
             self.reporting.register(relative_path, device_id, timestamp)
         stream = path.open("xb")
-        session = DeviceSession(device_id, relative_path, stream, self._events, self.reporting)
+        session = DeviceSession(
+            device_id,
+            relative_path,
+            stream,
+            self._events,
+            self.reporting,
+            data_dir=self._data_dir,
+            opened_at=created_at,
+        )
         try:
             self._events.write(
                 {

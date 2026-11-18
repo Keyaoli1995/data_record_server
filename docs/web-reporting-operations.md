@@ -81,6 +81,22 @@ docker compose run --rm --no-deps collector python -m data_record_server.reporti
 
 --path 仍是相对于 DATA_DIR 的本地路径，发布时转换为 WEB_STORAGE_ROOT 下路径。缺文件、越界或损坏记录保留 ERROR，不用改原始数据掩盖问题。待补发及 ERROR 文件受保留清理保护，应监控磁盘。队列日志输出数量、年龄和字节数，状态命令显示需对账的 fileKey。
 
+## 多连接录制的 Web 兼容性
+
+录制服务为每个 TCP 连接保留独立的原始 JSONL，但不会把这些内部归档路径上报给 Web。
+主文件路径和 `storageUri` 保持原有格式，因此 Web 的实时预览、归档和后续转换接口无需增加字段或修改调用方式。
+
+录制过程中，主文件仍按到达顺序持续追加，便于实时预览；会话关闭后，服务在本地将各连接原始文件按
+`gpsTime` 合并、去重和排序，再用原子替换更新主文件。Web 只应在结束接口成功后读取主文件作为转换输入，
+不要读取 `data/connections/` 下的内部文件。
+
+`session_closed` 事件可能包含以下本地审计字段：`canonical_record_count`（最终主文件记录数）、
+`canonical_quarantined_count`（被隔离的记录数）、`canonical_duplicate_count`（完全重复行数）和
+`raw_connection_count`（本次会话连接数）。这些字段不属于 Web ICD 请求，不需要转发。
+
+如果规范化失败，结束上报的 `closeReason` 为 `handler_error`，主文件保留实时预览内容，Web 应按失败任务处理；
+如果没有有效 `gpsTime`，服务不清空原主文件，并不会生成可用于转换的规范化轨迹。
+
 ## 本地验证
 
 使用 Python 3.12 的隔离环境安装 requirements-reporting.txt 和 requirements-dev.txt，然后执行：

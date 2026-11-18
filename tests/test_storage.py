@@ -328,6 +328,46 @@ class StorageTest(unittest.TestCase):
             },
         )
 
+    def test_close_replaces_preview_with_sorted_canonical_data_and_keeps_raw_connections(self):
+        clock = MutableUtcClock(datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc))
+        base_ms = int(clock.value.timestamp() * 1000)
+        records = [
+            f'{{"deviceId":"D1","gpsTime":"{base_ms + 2000}","n":2}}\n'.encode(),
+            f'{{"deviceId":"D1","gpsTime":"{base_ms + 1000}","n":1}}\n'.encode(),
+            f'{{"deviceId":"D1","gpsTime":"{base_ms + 1000}","n":1}}\n'.encode(),
+            b'{"deviceId":"D1","gpsTime":"0","n":0}\n',
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(directory, clock=clock)
+            session = storage.append_record(("203.0.113.20", 5020), "D1", records[0])
+            storage.append_record(("203.0.113.21", 5021), "D1", records[1])
+            storage.append_record(("203.0.113.21", 5021), "D1", records[2])
+            storage.append_record(("203.0.113.20", 5020), "D1", records[3])
+            storage.close_all_sessions()
+
+            main = (Path(directory) / session.relative_path).read_bytes().splitlines()
+            raw_files = list((Path(directory) / "connections").glob("*.jsonl"))
+            quarantine = list((Path(directory) / "connections" / "quarantine").glob("*.jsonl"))
+            quarantine_bytes = quarantine[0].read_bytes()
+            events = [
+                json.loads(line)
+                for line in (Path(directory) / "events.jsonl").read_text().splitlines()
+            ]
+
+        self.assertEqual(
+            [records[1].rstrip(), records[0].rstrip()],
+            main,
+        )
+        self.assertEqual(2, len(raw_files))
+        self.assertEqual(1, len(quarantine))
+        self.assertEqual(records[3].rstrip(), quarantine_bytes.rstrip())
+        closed = [event for event in events if event["event"] == "session_closed"][-1]
+        self.assertEqual(2, closed["canonical_record_count"])
+        self.assertEqual(1, closed["canonical_quarantined_count"])
+        self.assertEqual(1, closed["canonical_duplicate_count"])
+        self.assertEqual(2, closed["raw_connection_count"])
+
     def test_attaches_each_client_only_on_its_first_record_for_a_session(self):
         clock = MutableUtcClock(datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc))
 
